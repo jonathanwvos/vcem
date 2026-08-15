@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::analysis::intensity_histogram_from_path;
+use crate::analysis::{gamma_adjusted_image_from_path, intensity_histogram_from_path};
 use crate::types::{DisplayedImage, ImageFile, IntensityHistogram};
 
 pub struct VCEMApp {
@@ -33,6 +33,8 @@ pub struct VCEMApp {
     histogram: Option<IntensityHistogram>,
     histogram_error: Option<String>,
     reset_histogram_view: bool,
+    gamma_value: f64,
+    applied_gamma: Option<f64>,
 }
 
 struct ImageCandidate {
@@ -80,6 +82,8 @@ impl VCEMApp {
             histogram: None,
             histogram_error: None,
             reset_histogram_view: false,
+            gamma_value: 1.0,
+            applied_gamma: None,
         }
     }
 
@@ -196,6 +200,7 @@ impl VCEMApp {
                         self.histogram = None;
                         self.histogram_error = None;
                         self.reset_histogram_view = true;
+                        self.applied_gamma = None;
                     }
                 }
             });
@@ -226,7 +231,7 @@ impl VCEMApp {
                     }
 
                     ui.add_space(5.0);
-                    ui.heading("Raw Histogram");
+                    ui.heading("Intensity Histogram");
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("Bin count");
@@ -237,7 +242,7 @@ impl VCEMApp {
                         );
                     });
 
-                    if ui.button("Create Intensity Histogram").clicked() {
+                    if ui.button("Create Histogram").clicked() {
                         self.create_intensity_histogram();
                     }
 
@@ -255,6 +260,22 @@ impl VCEMApp {
                         ));
                         self.show_histogram_zoom_controls(ui, &histogram);
                         self.show_histogram_plot(ui, &histogram);
+                    }
+
+                    ui.add_space(8.0);
+                    ui.heading("Gamma Adjustment");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Gamma");
+                        ui.add(
+                            DragValue::new(&mut self.gamma_value)
+                                .range(0.001..=2.0)
+                                .speed(0.01),
+                        );
+                    });
+
+                    if ui.button("Apply Gamma Adjustment").clicked() {
+                        self.apply_gamma_adjustment(ui.ctx());
                     }
                 } else {
                     ui.label("Analytical results live here.");
@@ -640,6 +661,7 @@ impl VCEMApp {
             self.histogram = None;
             self.histogram_error = None;
             self.reset_histogram_view = true;
+            self.applied_gamma = None;
         }
     }
 
@@ -656,14 +678,65 @@ impl VCEMApp {
             return;
         };
 
-        match intensity_histogram_from_path(&path, self.histogram_bin_count) {
-            Ok(histogram) => {
-                self.histogram = Some(histogram);
+        if let Some(gamma) = self.applied_gamma {
+            match gamma_adjusted_image_from_path(&path, gamma, self.histogram_bin_count) {
+                Ok(processed) => {
+                    self.histogram = Some(processed.histogram);
+                    self.reset_histogram_view = true;
+                }
+                Err(error) => {
+                    self.histogram_error = Some(error);
+                    self.reset_histogram_view = true;
+                }
+            }
+        } else {
+            match intensity_histogram_from_path(&path, self.histogram_bin_count) {
+                Ok(histogram) => {
+                    self.histogram = Some(histogram);
+                    self.reset_histogram_view = true;
+                }
+                Err(error) => {
+                    self.histogram_error = Some(error);
+                    self.reset_histogram_view = true;
+                }
+            }
+        }
+    }
+
+    fn apply_gamma_adjustment(&mut self, ctx: &egui::Context) {
+        self.viewer_error = None;
+        self.histogram_error = None;
+
+        let Some((image_index, path, name)) = self.selected_image.and_then(|index| {
+            self.images
+                .get(index)
+                .map(|image| (index, image.path.clone(), image.name.clone()))
+        }) else {
+            self.histogram_error = Some("Select an image before applying gamma.".to_owned());
+            return;
+        };
+
+        match gamma_adjusted_image_from_path(&path, self.gamma_value, self.histogram_bin_count) {
+            Ok(processed) => {
+                let texture_name = format!("{} gamma {:.3}", name, self.gamma_value);
+                let texture =
+                    ctx.load_texture(texture_name, processed.color_image, TextureOptions::LINEAR);
+                let should_fit = self.displayed_image.is_none();
+                self.displayed_image = Some(DisplayedImage {
+                    image_index,
+                    size: processed.size,
+                    texture,
+                });
+                self.histogram = Some(processed.histogram);
+                self.applied_gamma = Some(self.gamma_value);
                 self.reset_histogram_view = true;
+                if should_fit {
+                    self.viewer_needs_fit = true;
+                }
             }
             Err(error) => {
+                self.viewer_error = Some(error.clone());
                 self.histogram_error = Some(error);
-                self.reset_histogram_view = true;
             }
         }
     }
@@ -739,13 +812,35 @@ impl VCEMApp {
         self.displayed_image = None;
         self.viewer_error = None;
 
-        match Self::load_displayed_image(ctx, image_index, path) {
-            Ok(image) => {
-                self.displayed_image = Some(image);
-                self.viewer_needs_fit = true;
+        if let Some(gamma) = self.applied_gamma {
+            match gamma_adjusted_image_from_path(&path, gamma, self.histogram_bin_count) {
+                Ok(processed) => {
+                    let texture = ctx.load_texture(
+                        format!("gamma-adjusted image {image_index}"),
+                        processed.color_image,
+                        TextureOptions::LINEAR,
+                    );
+                    self.histogram = Some(processed.histogram);
+                    self.displayed_image = Some(DisplayedImage {
+                        image_index,
+                        size: processed.size,
+                        texture,
+                    });
+                    self.viewer_needs_fit = true;
+                }
+                Err(error) => {
+                    self.viewer_error = Some(error);
+                }
             }
-            Err(error) => {
-                self.viewer_error = Some(error);
+        } else {
+            match Self::load_displayed_image(ctx, image_index, path) {
+                Ok(image) => {
+                    self.displayed_image = Some(image);
+                    self.viewer_needs_fit = true;
+                }
+                Err(error) => {
+                    self.viewer_error = Some(error);
+                }
             }
         }
     }

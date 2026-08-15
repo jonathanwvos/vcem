@@ -1,4 +1,4 @@
-use eframe::egui::{TextureHandle, Vec2};
+use eframe::egui::{ColorImage, TextureHandle, Vec2};
 use std::path::PathBuf;
 
 pub struct ImageFile {
@@ -10,6 +10,12 @@ pub struct DisplayedImage {
     pub image_index: usize,
     pub size: Vec2,
     pub texture: TextureHandle,
+}
+
+pub struct ProcessedImage {
+    pub size: Vec2,
+    pub color_image: ColorImage,
+    pub histogram: IntensityHistogram,
 }
 
 #[derive(Clone)]
