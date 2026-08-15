@@ -1,0 +1,12 @@
+jupyter
+numpy
+opencv-python
+scikit-image
+matplotlib
+pillow
+tqdm
+pathlib
+scikit-learn
+tifffile
+imagecodecs
+ipywidgets

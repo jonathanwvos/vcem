@@ -1,0 +1,11 @@
+[package]
+name = "vcem"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.35.0"
+image = "0.25.10"
+opencv = "0.100.1"
+egui_extras = { version = "0.35", features = ["all_loaders"] }
+egui_plot = "0.36"

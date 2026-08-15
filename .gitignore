@@ -1,0 +1,5 @@
+/target
+.ipynb_checkpoints
+.vscode
+__pycache__
+data
