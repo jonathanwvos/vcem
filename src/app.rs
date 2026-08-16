@@ -2,7 +2,7 @@ use eframe::{
     App, CreationContext, Frame,
     egui::{
         self, Button, CentralPanel, Color32, DragValue, Id, Modal, Panel, PointerButton, Pos2,
-        Rect, ScrollArea, Sense, TextureOptions, Ui, Vec2,
+        Rect, ScrollArea, Sense, Stroke, TextureOptions, Ui, Vec2,
     },
 };
 use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints, PlotUi};
@@ -59,6 +59,8 @@ pub struct VCEMApp {
     applied_cellular_automata: Option<CellularAutomataSettings>,
     cellular_kernel_preset: CellularKernelPreset,
     cellular_kernel_angle: f32,
+    cellular_kernel_brush: CellularKernelBrush,
+    cellular_kernel_drag_brush: Option<CellularKernelBrush>,
     configuration_path: String,
     saved_configuration: Option<ExperimentConfiguration>,
     configuration_notice: Option<String>,
@@ -110,6 +112,13 @@ enum CellularKernelPreset {
     Cross,
     Crescent,
     Clear,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellularKernelBrush {
+    Empty,
+    Positive,
+    Negative,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -172,6 +181,8 @@ impl VCEMApp {
             applied_cellular_automata: None,
             cellular_kernel_preset: CellularKernelPreset::Disk,
             cellular_kernel_angle: 0.0,
+            cellular_kernel_brush: CellularKernelBrush::Positive,
+            cellular_kernel_drag_brush: None,
             configuration_path,
             saved_configuration: None,
             configuration_notice: None,
@@ -693,42 +704,79 @@ impl VCEMApp {
 
             ui.add_space(4.0);
             let size = self.cellular_automata_settings.kernel_size;
-            let cell_size = (ui.available_width() / size as f32 - 2.0).clamp(12.0, 24.0);
-            for y in 0..size {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    for x in 0..size {
-                        let index = y * size + x;
-                        let weight = self.cellular_automata_settings.kernel[index];
-                        let fill = if weight > 0.0 {
-                            Color32::from_rgb(27, 132, 122)
-                        } else if weight < 0.0 {
-                            Color32::from_rgb(177, 71, 80)
-                        } else {
-                            ui.visuals().widgets.inactive.bg_fill
-                        };
-                        let symbol = if weight > 0.0 {
-                            "+"
-                        } else if weight < 0.0 {
-                            "-"
-                        } else {
-                            ""
-                        };
+            let palette_width = ui.spacing().interact_size.x + 8.0;
+            let cell_size =
+                ((ui.available_width() - palette_width).max(0.0) / size as f32 - 2.0)
+                    .clamp(12.0, 24.0);
+            let primary_down = ui.input(|input| input.pointer.button_down(PointerButton::Primary));
+            if !primary_down {
+                self.cellular_kernel_drag_brush = None;
+            }
+            let pointer_pos = ui.input(|input| input.pointer.latest_pos());
+
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    for y in 0..size {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            for x in 0..size {
+                                let index = y * size + x;
+                                let weight = self.cellular_automata_settings.kernel[index];
+                                let response = ui
+                                    .add_sized(
+                                        [cell_size, cell_size],
+                                        kernel_weight_button(weight).sense(Sense::click_and_drag()),
+                                    )
+                                    .on_hover_text(
+                                        "Click toggles the selected brush. Drag paints with it. Right click cycles in reverse.",
+                                    );
+
+                                if response.clicked_by(PointerButton::Primary) {
+                                    self.cellular_automata_settings.kernel[index] =
+                                        toggle_kernel_weight(weight, self.cellular_kernel_brush);
+                                    self.cellular_kernel_preset = CellularKernelPreset::Custom;
+                                } else if response.clicked_by(PointerButton::Secondary) {
+                                    self.cellular_automata_settings.kernel[index] =
+                                        next_kernel_weight(weight, true);
+                                    self.cellular_kernel_preset = CellularKernelPreset::Custom;
+                                }
+
+                                if response.drag_started_by(PointerButton::Primary) {
+                                    self.cellular_kernel_drag_brush =
+                                        Some(self.cellular_kernel_brush);
+                                    self.cellular_automata_settings.kernel[index] =
+                                        self.cellular_kernel_brush.weight();
+                                    self.cellular_kernel_preset = CellularKernelPreset::Custom;
+                                }
+
+                                if primary_down
+                                    && pointer_pos.is_some_and(|pos| response.rect.contains(pos))
+                                    && let Some(brush) = self.cellular_kernel_drag_brush
+                                {
+                                    self.cellular_automata_settings.kernel[index] = brush.weight();
+                                    self.cellular_kernel_preset = CellularKernelPreset::Custom;
+                                }
+                            }
+                        });
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for brush in CellularKernelBrush::ALL {
                         let response = ui
-                            .add_sized([cell_size, cell_size], Button::new(symbol).fill(fill))
-                            .on_hover_text("Left click: + / - / 0. Right click: reverse.");
-                        if response.clicked_by(PointerButton::Primary) {
-                            self.cellular_automata_settings.kernel[index] =
-                                next_kernel_weight(weight, false);
-                            self.cellular_kernel_preset = CellularKernelPreset::Custom;
-                        } else if response.clicked_by(PointerButton::Secondary) {
-                            self.cellular_automata_settings.kernel[index] =
-                                next_kernel_weight(weight, true);
-                            self.cellular_kernel_preset = CellularKernelPreset::Custom;
+                            .add_sized(
+                                [cell_size, cell_size],
+                                kernel_brush_button(brush, self.cellular_kernel_brush == brush),
+                            )
+                            .on_hover_text(brush.hover_text());
+                        if response.clicked() {
+                            self.cellular_kernel_brush = brush;
                         }
                     }
                 });
-            }
+            });
         });
 
         ui.collapsing("Growth Response", |ui| {
@@ -2318,6 +2366,26 @@ impl CellularKernelPreset {
     }
 }
 
+impl CellularKernelBrush {
+    const ALL: [Self; 3] = [Self::Empty, Self::Positive, Self::Negative];
+
+    fn weight(self) -> f32 {
+        match self {
+            Self::Empty => 0.0,
+            Self::Positive => 1.0,
+            Self::Negative => -1.0,
+        }
+    }
+
+    fn hover_text(self) -> &'static str {
+        match self {
+            Self::Empty => "Paint empty kernel cells.",
+            Self::Positive => "Paint green positive kernel cells.",
+            Self::Negative => "Paint red negative kernel cells.",
+        }
+    }
+}
+
 fn resize_cellular_kernel(settings: &mut CellularAutomataSettings, new_size: usize) {
     let new_size = new_size.clamp(3, 15) | 1;
     let old_size = settings.kernel_size;
@@ -2377,6 +2445,55 @@ fn apply_cellular_kernel_preset(
             settings.kernel[y * size + x] = if active { 1.0 } else { 0.0 };
         }
     }
+}
+
+fn kernel_brush_button(brush: CellularKernelBrush, selected: bool) -> Button<'static> {
+    let mut button = kernel_weight_button(brush.weight());
+    if selected {
+        button = button.stroke(Stroke::new(2.0, Color32::from_rgb(230, 170, 64)));
+    }
+    button
+}
+
+fn kernel_weight_button(weight: f32) -> Button<'static> {
+    let mut button = Button::new(kernel_weight_symbol(weight));
+    if let Some(fill) = kernel_weight_fill(weight) {
+        button = button.fill(fill);
+    }
+    button
+}
+
+fn kernel_weight_symbol(weight: f32) -> &'static str {
+    if weight > 0.0 {
+        "+"
+    } else if weight < 0.0 {
+        "-"
+    } else {
+        ""
+    }
+}
+
+fn kernel_weight_fill(weight: f32) -> Option<Color32> {
+    if weight > 0.0 {
+        Some(Color32::from_rgb(27, 132, 122))
+    } else if weight < 0.0 {
+        Some(Color32::from_rgb(177, 71, 80))
+    } else {
+        None
+    }
+}
+
+fn toggle_kernel_weight(weight: f32, brush: CellularKernelBrush) -> f32 {
+    let brush_weight = brush.weight();
+    if kernel_weights_match(weight, brush_weight) {
+        0.0
+    } else {
+        brush_weight
+    }
+}
+
+fn kernel_weights_match(left: f32, right: f32) -> bool {
+    left.signum() == right.signum()
 }
 
 fn next_kernel_weight(weight: f32, reverse: bool) -> f32 {
