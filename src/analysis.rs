@@ -29,13 +29,14 @@ pub fn gamma_adjusted_image_from_path(
     gamma: f64,
     bin_count: usize,
 ) -> std::result::Result<ProcessedImage, String> {
-    processed_image_from_path(path, None, false, Some(gamma), bin_count)
+    processed_image_from_path(path, None, false, None, Some(gamma), bin_count)
 }
 
 pub fn processed_image_from_path(
     path: &Path,
     denoise: Option<DenoiseSettings>,
     invert: bool,
+    equalization: Option<f64>,
     gamma: Option<f64>,
     bin_count: usize,
 ) -> std::result::Result<ProcessedImage, String> {
@@ -56,6 +57,19 @@ pub fn processed_image_from_path(
     if invert {
         invert_values(&mut plane.values, plane.max_value);
         description = format!("{} + inverted values", description);
+    }
+
+    if let Some(strength) = equalization {
+        let strength = strength.clamp(0.0, 1.0);
+        if strength > 0.0 {
+            equalize_histogram_values(
+                &mut plane.values,
+                plane.max_value,
+                plane.value_range,
+                strength,
+            );
+            description = format!("{} + equalized {:.0}%", description, strength * 100.0);
+        }
     }
 
     if let Some(gamma) = gamma {
@@ -679,6 +693,47 @@ fn invert_values(values: &mut [u32], max_value: u32) {
     }
 }
 
+fn equalize_histogram_values(values: &mut [u32], max_value: u32, value_range: u64, strength: f64) {
+    if values.is_empty() || max_value == 0 || strength <= 0.0 {
+        return;
+    }
+
+    let histogram_len = value_range.min(max_value as u64 + 1).max(1) as usize;
+    let mut histogram = vec![0_u64; histogram_len];
+    for value in values.iter().copied() {
+        let index = (value as usize).min(histogram_len - 1);
+        histogram[index] += 1;
+    }
+
+    let Some(cdf_min) = histogram.iter().copied().find(|count| *count > 0) else {
+        return;
+    };
+    let total = values.len() as u64;
+    if total <= cdf_min {
+        return;
+    }
+
+    let denominator = (total - cdf_min) as f64;
+    let mut cumulative = 0_u64;
+    let mut lookup = Vec::with_capacity(histogram_len);
+    for count in histogram {
+        cumulative += count;
+        let equalized = ((cumulative.saturating_sub(cdf_min)) as f64 / denominator
+            * max_value as f64)
+            .round()
+            .clamp(0.0, max_value as f64) as u32;
+        lookup.push(equalized);
+    }
+
+    let original_weight = 1.0 - strength;
+    for value in values {
+        let equalized = lookup[(*value as usize).min(lookup.len() - 1)];
+        *value = (*value as f64 * original_weight + equalized as f64 * strength)
+            .round()
+            .clamp(0.0, max_value as f64) as u32;
+    }
+}
+
 fn histogram_from_values(
     values: impl Iterator<Item = u32>,
     bin_count: usize,
@@ -776,6 +831,24 @@ impl DenoiseSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equalizes_values_across_available_range() {
+        let mut values = vec![10, 10, 20, 30];
+
+        equalize_histogram_values(&mut values, 65_535, 65_536, 1.0);
+
+        assert_eq!(values, vec![0, 0, 32_768, 65_535]);
+    }
+
+    #[test]
+    fn blends_equalized_values_with_original_values() {
+        let mut values = vec![10, 10, 20, 30];
+
+        equalize_histogram_values(&mut values, 65_535, 65_536, 0.5);
+
+        assert_eq!(values, vec![5, 5, 16_394, 32_783]);
+    }
 
     #[test]
     #[ignore = "requires the local RELION float TIFF fixture"]

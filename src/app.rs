@@ -49,6 +49,8 @@ pub struct VCEMApp {
     applied_denoise: Option<DenoiseSettings>,
     invert_values: bool,
     applied_invert: bool,
+    equalization_strength: f64,
+    applied_equalization: Option<f64>,
     gamma_value: f64,
     applied_gamma: Option<f64>,
     processing_job: Option<ProcessingJob>,
@@ -82,24 +84,35 @@ enum ProcessingKind {
     Preview {
         denoise: Option<DenoiseSettings>,
         invert: bool,
+        equalization: Option<f64>,
         gamma: Option<f64>,
         bin_count: usize,
     },
     Denoise {
         denoise: Option<DenoiseSettings>,
         invert: bool,
+        equalization: Option<f64>,
         gamma: Option<f64>,
         bin_count: usize,
     },
     Invert {
         denoise: Option<DenoiseSettings>,
         invert: bool,
+        equalization: Option<f64>,
+        gamma: Option<f64>,
+        bin_count: usize,
+    },
+    Equalize {
+        denoise: Option<DenoiseSettings>,
+        invert: bool,
+        equalization: Option<f64>,
         gamma: Option<f64>,
         bin_count: usize,
     },
     Gamma {
         denoise: Option<DenoiseSettings>,
         invert: bool,
+        equalization: Option<f64>,
         gamma: f64,
         bin_count: usize,
     },
@@ -154,6 +167,8 @@ impl VCEMApp {
             applied_denoise: None,
             invert_values: false,
             applied_invert: false,
+            equalization_strength: 0.0,
+            applied_equalization: None,
             gamma_value: 1.0,
             applied_gamma: None,
             processing_job: None,
@@ -278,6 +293,8 @@ impl VCEMApp {
                         self.applied_denoise = None;
                         self.invert_values = false;
                         self.applied_invert = false;
+                        self.equalization_strength = 0.0;
+                        self.applied_equalization = None;
                         self.applied_gamma = None;
                         self.processing_job = None;
                     }
@@ -453,6 +470,29 @@ impl VCEMApp {
                         .clicked()
                     {
                         self.apply_inversion(ui.ctx());
+                    }
+
+                    ui.add_space(8.0);
+                    ui.heading("Distribution Equalization");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Strength");
+                        ui.add(
+                            egui::Slider::new(&mut self.equalization_strength, 0.0..=1.0)
+                                .show_value(true),
+                        );
+                    });
+                    if ui
+                        .add_enabled(
+                            !is_processing
+                                && Some(self.equalization_strength) != self.applied_equalization
+                                && (self.equalization_strength > 0.0
+                                    || self.applied_equalization.is_some()),
+                            Button::new("Apply Equalization"),
+                        )
+                        .clicked()
+                    {
+                        self.apply_equalization(ui.ctx());
                     }
 
                     ui.add_space(8.0);
@@ -1059,11 +1099,16 @@ impl VCEMApp {
             return;
         };
 
-        if self.applied_denoise.is_some() || self.applied_invert || self.applied_gamma.is_some() {
+        if self.applied_denoise.is_some()
+            || self.applied_invert
+            || self.applied_equalization.is_some()
+            || self.applied_gamma.is_some()
+        {
             match processed_image_from_path(
                 &path,
                 self.applied_denoise,
                 self.applied_invert,
+                self.applied_equalization,
                 self.applied_gamma,
                 self.histogram_bin_count,
             ) {
@@ -1104,6 +1149,8 @@ impl VCEMApp {
         self.applied_denoise.is_some()
             || self.applied_invert
             || self.invert_values
+            || self.applied_equalization.is_some()
+            || self.equalization_strength != 0.0
             || self.applied_gamma.is_some()
             || self.denoise_method != DenoiseMethod::None
             || self.denoise_kernel_size != 3
@@ -1135,6 +1182,7 @@ impl VCEMApp {
             ProcessingKind::Denoise {
                 denoise,
                 invert: self.applied_invert,
+                equalization: self.applied_equalization,
                 gamma: self.applied_gamma,
                 bin_count: self.histogram_bin_count,
             },
@@ -1162,6 +1210,36 @@ impl VCEMApp {
             ProcessingKind::Invert {
                 denoise: self.applied_denoise,
                 invert: self.invert_values,
+                equalization: self.applied_equalization,
+                gamma: self.applied_gamma,
+                bin_count: self.histogram_bin_count,
+            },
+        );
+    }
+
+    fn apply_equalization(&mut self, ctx: &egui::Context) {
+        self.viewer_error = None;
+        self.histogram_error = None;
+
+        let Some((image_index, path, name)) = self.selected_image.and_then(|index| {
+            self.images
+                .get(index)
+                .map(|image| (index, image.path.clone(), image.name.clone()))
+        }) else {
+            self.histogram_error = Some("Select an image before applying equalization.".to_owned());
+            return;
+        };
+
+        let equalization = (self.equalization_strength > 0.0).then_some(self.equalization_strength);
+        self.start_processing_job(
+            ctx,
+            image_index,
+            path,
+            name,
+            ProcessingKind::Equalize {
+                denoise: self.applied_denoise,
+                invert: self.applied_invert,
+                equalization,
                 gamma: self.applied_gamma,
                 bin_count: self.histogram_bin_count,
             },
@@ -1189,6 +1267,7 @@ impl VCEMApp {
             ProcessingKind::Gamma {
                 denoise: self.applied_denoise,
                 invert: self.applied_invert,
+                equalization: self.applied_equalization,
                 gamma: self.gamma_value,
                 bin_count: self.histogram_bin_count,
             },
@@ -1206,6 +1285,8 @@ impl VCEMApp {
         self.applied_denoise = None;
         self.invert_values = false;
         self.applied_invert = false;
+        self.equalization_strength = 0.0;
+        self.applied_equalization = None;
         self.applied_gamma = None;
         self.denoise_method = DenoiseMethod::None;
         self.denoise_kernel_size = 3;
@@ -1239,27 +1320,73 @@ impl VCEMApp {
                 ProcessingKind::Preview {
                     denoise,
                     invert,
+                    equalization,
                     gamma,
                     bin_count,
-                } => processed_image_from_path(&path, denoise, invert, gamma, bin_count),
+                } => processed_image_from_path(
+                    &path,
+                    denoise,
+                    invert,
+                    equalization,
+                    gamma,
+                    bin_count,
+                ),
                 ProcessingKind::Denoise {
                     denoise,
                     invert,
+                    equalization,
                     gamma,
                     bin_count,
-                } => processed_image_from_path(&path, denoise, invert, gamma, bin_count),
+                } => processed_image_from_path(
+                    &path,
+                    denoise,
+                    invert,
+                    equalization,
+                    gamma,
+                    bin_count,
+                ),
                 ProcessingKind::Invert {
                     denoise,
                     invert,
+                    equalization,
                     gamma,
                     bin_count,
-                } => processed_image_from_path(&path, denoise, invert, gamma, bin_count),
+                } => processed_image_from_path(
+                    &path,
+                    denoise,
+                    invert,
+                    equalization,
+                    gamma,
+                    bin_count,
+                ),
+                ProcessingKind::Equalize {
+                    denoise,
+                    invert,
+                    equalization,
+                    gamma,
+                    bin_count,
+                } => processed_image_from_path(
+                    &path,
+                    denoise,
+                    invert,
+                    equalization,
+                    gamma,
+                    bin_count,
+                ),
                 ProcessingKind::Gamma {
                     denoise,
                     invert,
+                    equalization,
                     gamma,
                     bin_count,
-                } => processed_image_from_path(&path, denoise, invert, Some(gamma), bin_count),
+                } => processed_image_from_path(
+                    &path,
+                    denoise,
+                    invert,
+                    equalization,
+                    Some(gamma),
+                    bin_count,
+                ),
             };
             let _ = sender.send(ProcessingResult {
                 id,
@@ -1501,6 +1628,7 @@ impl VCEMApp {
             ProcessingKind::Preview {
                 denoise: self.applied_denoise,
                 invert: self.applied_invert,
+                equalization: self.applied_equalization,
                 gamma: self.applied_gamma,
                 bin_count: self.histogram_bin_count,
             },
@@ -1535,6 +1663,7 @@ impl ProcessingKind {
             Self::Preview { .. } => "preview",
             Self::Denoise { .. } => "denoising",
             Self::Invert { .. } => "inversion",
+            Self::Equalize { .. } => "equalization",
             Self::Gamma { .. } => "gamma adjustment",
         }
     }
@@ -1552,6 +1681,12 @@ impl ProcessingKind {
                 let stage_name = if invert { "inverted" } else { "uninverted" };
                 format!("{image_name} {stage_name} values")
             }
+            Self::Equalize { equalization, .. } => {
+                let stage_name = equalization
+                    .map(|strength| format!("equalized {:.0}%", strength * 100.0))
+                    .unwrap_or_else(|| "unequalized".to_owned());
+                format!("{image_name} {stage_name}")
+            }
             Self::Gamma { gamma, .. } => format!("{image_name} gamma {gamma:.3}"),
         }
     }
@@ -1565,6 +1700,10 @@ impl ProcessingKind {
             Self::Invert { invert, .. } => {
                 app.applied_invert = invert;
                 app.invert_values = invert;
+            }
+            Self::Equalize { equalization, .. } => {
+                app.applied_equalization = equalization;
+                app.equalization_strength = equalization.unwrap_or(0.0);
             }
             Self::Gamma { gamma, .. } => {
                 app.applied_gamma = Some(gamma);
