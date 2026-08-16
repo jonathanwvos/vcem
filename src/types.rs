@@ -29,16 +29,12 @@ pub enum DenoiseMethod {
     None,
     Median,
     Gaussian,
-    NonLocalMeans,
 }
 
 #[derive(Clone, Copy)]
 pub struct DenoiseSettings {
     pub method: DenoiseMethod,
     pub kernel_size: usize,
-    pub strength: f64,
-    pub template_window: usize,
-    pub search_window: usize,
 }
 
 #[derive(Clone)]

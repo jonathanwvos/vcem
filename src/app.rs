@@ -43,9 +43,6 @@ pub struct VCEMApp {
     histogram_selection_start_bin: Option<usize>,
     denoise_method: DenoiseMethod,
     denoise_kernel_size: usize,
-    denoise_strength: f64,
-    denoise_template_window: usize,
-    denoise_search_window: usize,
     applied_denoise: Option<DenoiseSettings>,
     invert_values: bool,
     applied_invert: bool,
@@ -161,9 +158,6 @@ impl VCEMApp {
             histogram_selection_start_bin: None,
             denoise_method: DenoiseMethod::None,
             denoise_kernel_size: 3,
-            denoise_strength: 7.0,
-            denoise_template_window: 7,
-            denoise_search_window: 21,
             applied_denoise: None,
             invert_values: false,
             applied_invert: false,
@@ -408,11 +402,6 @@ impl VCEMApp {
                                 DenoiseMethod::Gaussian,
                                 DenoiseMethod::Gaussian.label(),
                             );
-                            ui.selectable_value(
-                                &mut self.denoise_method,
-                                DenoiseMethod::NonLocalMeans,
-                                DenoiseMethod::NonLocalMeans.label(),
-                            );
                         });
 
                     match self.denoise_method {
@@ -425,28 +414,6 @@ impl VCEMApp {
                                 ui.selectable_value(&mut self.denoise_kernel_size, 3, "3");
                                 ui.selectable_value(&mut self.denoise_kernel_size, 5, "5");
                                 ui.selectable_value(&mut self.denoise_kernel_size, 7, "7");
-                            });
-                        }
-                        DenoiseMethod::NonLocalMeans => {
-                            ui.horizontal(|ui| {
-                                ui.label("Strength");
-                                ui.add(
-                                    DragValue::new(&mut self.denoise_strength)
-                                        .range(0.1..=30.0)
-                                        .speed(0.1),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Template");
-                                ui.selectable_value(&mut self.denoise_template_window, 3, "3");
-                                ui.selectable_value(&mut self.denoise_template_window, 5, "5");
-                                ui.selectable_value(&mut self.denoise_template_window, 7, "7");
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Search");
-                                ui.selectable_value(&mut self.denoise_search_window, 11, "11");
-                                ui.selectable_value(&mut self.denoise_search_window, 21, "21");
-                                ui.selectable_value(&mut self.denoise_search_window, 31, "31");
                             });
                         }
                     }
@@ -1139,9 +1106,6 @@ impl VCEMApp {
         (self.denoise_method != DenoiseMethod::None).then_some(DenoiseSettings {
             method: self.denoise_method,
             kernel_size: self.denoise_kernel_size,
-            strength: self.denoise_strength,
-            template_window: self.denoise_template_window,
-            search_window: self.denoise_search_window,
         })
     }
 
@@ -1154,9 +1118,6 @@ impl VCEMApp {
             || self.applied_gamma.is_some()
             || self.denoise_method != DenoiseMethod::None
             || self.denoise_kernel_size != 3
-            || self.denoise_strength != 7.0
-            || self.denoise_template_window != 7
-            || self.denoise_search_window != 21
             || self.gamma_value != 1.0
     }
 
@@ -1290,9 +1251,6 @@ impl VCEMApp {
         self.applied_gamma = None;
         self.denoise_method = DenoiseMethod::None;
         self.denoise_kernel_size = 3;
-        self.denoise_strength = 7.0;
-        self.denoise_template_window = 7;
-        self.denoise_search_window = 21;
         self.gamma_value = 1.0;
         self.processing_job = None;
         ctx.request_repaint();
@@ -1798,7 +1756,6 @@ impl DenoiseMethod {
             Self::None => "None",
             Self::Median => "Median",
             Self::Gaussian => "Gaussian",
-            Self::NonLocalMeans => "Non-Local Means",
         }
     }
 }

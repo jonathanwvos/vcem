@@ -44,13 +44,7 @@ pub fn processed_image_from_path(
     let mut description = plane.source_description.clone();
 
     if let Some(settings) = denoise.filter(|settings| settings.method != DenoiseMethod::None) {
-        apply_denoise(
-            &mut plane.values,
-            plane.width,
-            plane.height,
-            plane.max_value,
-            settings,
-        )?;
+        apply_denoise(&mut plane.values, plane.width, plane.height, settings)?;
         description = format!("{} + {}", description, settings.label());
     }
 
@@ -460,7 +454,6 @@ fn apply_denoise(
     values: &mut Vec<u32>,
     width: usize,
     height: usize,
-    max_value: u32,
     settings: DenoiseSettings,
 ) -> std::result::Result<(), String> {
     match settings.method {
@@ -471,10 +464,6 @@ fn apply_denoise(
         }
         DenoiseMethod::Gaussian => {
             *values = gaussian_filter(values, width, height, settings.kernel_size);
-            Ok(())
-        }
-        DenoiseMethod::NonLocalMeans => {
-            *values = non_local_means_filter(values, width, height, max_value, settings);
             Ok(())
         }
     }
@@ -555,103 +544,6 @@ fn gaussian_filter(values: &[u32], width: usize, height: usize, kernel_size: usi
     }
 
     output
-}
-
-fn non_local_means_filter(
-    values: &[u32],
-    width: usize,
-    height: usize,
-    max_value: u32,
-    settings: DenoiseSettings,
-) -> Vec<u32> {
-    if values.is_empty() || width == 0 || height == 0 {
-        return values.to_vec();
-    }
-
-    let template_radius = kernel_radius(settings.template_window);
-    let search_radius = settings.search_window.max(3) / 2;
-    let template_offsets = square_offsets(template_radius);
-    let search_offsets = square_offsets(search_radius);
-    let patch_area = template_offsets.len() as f64;
-    let strength = (settings.strength.max(0.1) / 255.0 * max_value.max(1) as f64).max(f64::EPSILON);
-    let strength_squared = strength * strength;
-    let mut output = vec![0; values.len()];
-
-    for y in 0..height {
-        for x in 0..width {
-            let mut weighted_sum = 0.0;
-            let mut weight_total = 0.0;
-
-            for (search_dx, search_dy) in &search_offsets {
-                let sample_x = clamp_coord(x as isize + search_dx, width);
-                let sample_y = clamp_coord(y as isize + search_dy, height);
-                let distance = patch_distance(
-                    values,
-                    width,
-                    height,
-                    x,
-                    y,
-                    sample_x,
-                    sample_y,
-                    &template_offsets,
-                ) / patch_area;
-                let weight = (-distance / strength_squared).exp();
-
-                weighted_sum += values[sample_y * width + sample_x] as f64 * weight;
-                weight_total += weight;
-            }
-
-            output[y * width + x] = (weighted_sum / weight_total.max(f64::EPSILON))
-                .round()
-                .clamp(0.0, max_value as f64) as u32;
-        }
-    }
-
-    output
-}
-
-fn patch_distance(
-    values: &[u32],
-    width: usize,
-    height: usize,
-    left_x: usize,
-    left_y: usize,
-    right_x: usize,
-    right_y: usize,
-    offsets: &[(isize, isize)],
-) -> f64 {
-    let mut distance = 0.0;
-
-    for (dx, dy) in offsets {
-        let left_sample_x = clamp_coord(left_x as isize + dx, width);
-        let left_sample_y = clamp_coord(left_y as isize + dy, height);
-        let right_sample_x = clamp_coord(right_x as isize + dx, width);
-        let right_sample_y = clamp_coord(right_y as isize + dy, height);
-
-        let difference = values[left_sample_y * width + left_sample_x] as f64
-            - values[right_sample_y * width + right_sample_x] as f64;
-        distance += difference * difference;
-    }
-
-    distance
-}
-
-fn square_offsets(radius: usize) -> Vec<(isize, isize)> {
-    let width = radius * 2 + 1;
-    let mut offsets = Vec::with_capacity(width * width);
-    let radius = radius as isize;
-
-    for y in -radius..=radius {
-        for x in -radius..=radius {
-            offsets.push((x, y));
-        }
-    }
-
-    offsets
-}
-
-fn clamp_coord(coord: isize, size: usize) -> usize {
-    coord.clamp(0, size as isize - 1) as usize
 }
 
 fn kernel_radius(kernel_size: usize) -> usize {
@@ -823,7 +715,6 @@ impl DenoiseSettings {
             DenoiseMethod::None => "no denoising",
             DenoiseMethod::Median => "median denoise",
             DenoiseMethod::Gaussian => "gaussian denoise",
-            DenoiseMethod::NonLocalMeans => "non-local means denoise",
         }
     }
 }
