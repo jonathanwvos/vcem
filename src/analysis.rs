@@ -2,12 +2,17 @@ use std::{fs::File, io::BufReader, path::Path};
 
 use eframe::egui::{ColorImage, Vec2};
 use image::{DynamicImage, imageops::FilterType};
+use rayon::prelude::*;
 use tiff::{
     ColorType,
     decoder::{Decoder, DecodingResult},
 };
 
-use crate::types::{DenoiseMethod, DenoiseSettings, IntensityHistogram, ProcessedImage};
+use crate::types::{
+    CellularAutomataResponse, CellularAutomataSeedMode, CellularAutomataSettings,
+    CellularAutomataSummary, DenoiseMethod, DenoiseSettings, ExperimentConfiguration,
+    ImageRotation, IntensityHistogram, ProcessedImage,
+};
 
 const MAX_PREVIEW_PIXELS: u64 = 1_048_576;
 
@@ -29,31 +34,44 @@ pub fn gamma_adjusted_image_from_path(
     gamma: f64,
     bin_count: usize,
 ) -> std::result::Result<ProcessedImage, String> {
-    processed_image_from_path(path, None, false, None, Some(gamma), bin_count)
+    let configuration = ExperimentConfiguration {
+        histogram_bin_count: bin_count,
+        gamma: Some(gamma),
+        ..ExperimentConfiguration::default()
+    };
+    processed_image_from_path(path, &configuration)
 }
 
 pub fn processed_image_from_path(
     path: &Path,
-    denoise: Option<DenoiseSettings>,
-    invert: bool,
-    equalization: Option<f64>,
-    gamma: Option<f64>,
-    bin_count: usize,
+    configuration: &ExperimentConfiguration,
 ) -> std::result::Result<ProcessedImage, String> {
     let mut plane = decode_gray_plane(path)?;
     let mut description = plane.source_description.clone();
 
-    if let Some(settings) = denoise.filter(|settings| settings.method != DenoiseMethod::None) {
+    if configuration.rotation != ImageRotation::None {
+        rotate_gray_plane(&mut plane, configuration.rotation);
+        description = format!(
+            "{} + rotated {}",
+            description,
+            configuration.rotation.degrees()
+        );
+    }
+
+    if let Some(settings) = configuration
+        .denoise
+        .filter(|settings| settings.method != DenoiseMethod::None)
+    {
         apply_denoise(&mut plane.values, plane.width, plane.height, settings)?;
         description = format!("{} + {}", description, settings.label());
     }
 
-    if invert {
+    if configuration.invert {
         invert_values(&mut plane.values, plane.max_value);
         description = format!("{} + inverted values", description);
     }
 
-    if let Some(strength) = equalization {
+    if let Some(strength) = configuration.equalization {
         let strength = strength.clamp(0.0, 1.0);
         if strength > 0.0 {
             equalize_histogram_values(
@@ -66,11 +84,19 @@ pub fn processed_image_from_path(
         }
     }
 
-    if let Some(gamma) = gamma {
-        let gamma = gamma.clamp(0.001, 2.0);
+    if let Some(gamma) = configuration.gamma {
+        let gamma = gamma.clamp(0.001, 4.0);
         apply_gamma_values(&mut plane.values, plane.max_value, gamma);
         description = format!("{} + gamma {:.3}", description, gamma);
     }
+
+    let cellular_automata = configuration
+        .cellular_automata
+        .as_ref()
+        .map(|settings| {
+            cellular_automata_overlay(&plane.values, plane.width, plane.height, settings)
+        })
+        .transpose()?;
 
     Ok(process_values(
         plane
@@ -79,10 +105,11 @@ pub fn processed_image_from_path(
             .copied()
             .zip(plane.alpha.iter().copied()),
         [plane.width, plane.height],
-        bin_count.clamp(2, 4096),
+        configuration.histogram_bin_count.clamp(2, 4096),
         plane.value_range,
         plane.max_value,
         &description,
+        cellular_automata,
     ))
 }
 
@@ -94,6 +121,43 @@ struct GrayPlane {
     value_range: u64,
     max_value: u32,
     source_description: String,
+}
+
+fn rotate_gray_plane(plane: &mut GrayPlane, rotation: ImageRotation) {
+    if rotation == ImageRotation::None || plane.values.is_empty() {
+        return;
+    }
+
+    let source_width = plane.width;
+    let source_height = plane.height;
+    let (target_width, target_height) = match rotation {
+        ImageRotation::None | ImageRotation::HalfTurn => (source_width, source_height),
+        ImageRotation::Clockwise90 | ImageRotation::Clockwise270 => (source_height, source_width),
+    };
+    let mut values = vec![0; plane.values.len()];
+    let mut alpha = vec![0; plane.alpha.len()];
+
+    for source_y in 0..source_height {
+        for source_x in 0..source_width {
+            let (target_x, target_y) = match rotation {
+                ImageRotation::None => (source_x, source_y),
+                ImageRotation::Clockwise90 => (source_height - 1 - source_y, source_x),
+                ImageRotation::HalfTurn => {
+                    (source_width - 1 - source_x, source_height - 1 - source_y)
+                }
+                ImageRotation::Clockwise270 => (source_y, source_width - 1 - source_x),
+            };
+            let source_index = source_y * source_width + source_x;
+            let target_index = target_y * target_width + target_x;
+            values[target_index] = plane.values[source_index];
+            alpha[target_index] = plane.alpha[source_index];
+        }
+    }
+
+    plane.width = target_width;
+    plane.height = target_height;
+    plane.values = values;
+    plane.alpha = alpha;
 }
 
 fn decode_gray_plane(path: &Path) -> std::result::Result<GrayPlane, String> {
@@ -626,6 +690,226 @@ fn equalize_histogram_values(values: &mut [u32], max_value: u32, value_range: u6
     }
 }
 
+fn cellular_automata_overlay(
+    values: &[u32],
+    width: usize,
+    height: usize,
+    settings: &CellularAutomataSettings,
+) -> std::result::Result<(ColorImage, CellularAutomataSummary), String> {
+    let (state, summary) = evolve_cellular_automata(values, width, height, settings)?;
+    let mut rgba = Vec::with_capacity(state.len() * 4);
+
+    for activation in state {
+        let alpha = (activation.sqrt() * 190.0).round().clamp(0.0, 190.0) as u8;
+        rgba.extend_from_slice(&[30, 210, 190, alpha]);
+    }
+
+    Ok((
+        ColorImage::from_rgba_unmultiplied([width, height], &rgba),
+        summary,
+    ))
+}
+
+fn evolve_cellular_automata(
+    values: &[u32],
+    width: usize,
+    height: usize,
+    settings: &CellularAutomataSettings,
+) -> std::result::Result<(Vec<f32>, CellularAutomataSummary), String> {
+    if width == 0 || height == 0 || values.len() != width * height {
+        return Err("Cellular automata requires a non-empty rectangular image.".to_owned());
+    }
+
+    let kernels = compile_cellular_kernels(settings)?;
+
+    let min_value = values.iter().copied().min().unwrap_or(0);
+    let max_value = values.iter().copied().max().unwrap_or(min_value);
+    let observed_range = max_value.saturating_sub(min_value) as f32;
+    let mut evidence = if observed_range <= f32::EPSILON {
+        vec![0.0; values.len()]
+    } else {
+        values
+            .iter()
+            .map(|value| (value.saturating_sub(min_value) as f32 / observed_range).clamp(0.0, 1.0))
+            .collect::<Vec<_>>()
+    };
+    if observed_range > f32::EPSILON && settings.seed_mode == CellularAutomataSeedMode::Dark {
+        for value in &mut evidence {
+            *value = 1.0 - *value;
+        }
+    }
+
+    let mut state = evidence.clone();
+    let mut next_state = vec![0.0_f32; state.len()];
+    let time_step = settings.time_step.clamp(0.001, 1.0);
+    let growth_rate = settings.growth_rate.clamp(0.0, 4.0);
+    let decay_rate = settings.decay_rate.clamp(0.0, 4.0);
+    let iterations = settings.iterations.clamp(1, 512);
+    let mut iterations_run = 0;
+    let mut converged = false;
+
+    for iteration in 0..iterations {
+        let max_change = next_state
+            .par_chunks_mut(width)
+            .enumerate()
+            .map(|(y, row)| {
+                let mut row_max_change = 0.0_f32;
+                for (x, output) in row.iter_mut().enumerate() {
+                    let index = y * width + x;
+                    let mut response = f32::NEG_INFINITY;
+
+                    for kernel in &kernels {
+                        let mut sensed = 0.0_f32;
+                        for sample in kernel {
+                            let sample_x = reflect_coordinate(x as isize + sample.offset_x, width);
+                            let sample_y = reflect_coordinate(y as isize + sample.offset_y, height);
+                            sensed += state[sample_y * width + sample_x] * sample.weight;
+                        }
+                        response = response.max(cellular_growth_response(sensed, settings));
+                    }
+
+                    let evidence_gated_response = if response > 0.0 {
+                        response * evidence[index]
+                    } else {
+                        response
+                    };
+                    let change = time_step
+                        * (growth_rate * evidence_gated_response - decay_rate * state[index]);
+                    let updated = (state[index] + change).clamp(0.0, 1.0);
+                    row_max_change = row_max_change.max((updated - state[index]).abs());
+                    *output = updated;
+                }
+                row_max_change
+            })
+            .reduce(|| 0.0, f32::max);
+
+        std::mem::swap(&mut state, &mut next_state);
+        iterations_run = iteration + 1;
+        if max_change < 0.0001 {
+            converged = true;
+            break;
+        }
+    }
+
+    let mean_activation = state.iter().sum::<f32>() / state.len() as f32;
+    let active_fraction = state
+        .iter()
+        .filter(|activation| **activation >= 0.1)
+        .count() as f32
+        / state.len() as f32;
+
+    Ok((
+        state,
+        CellularAutomataSummary {
+            iterations_run,
+            converged,
+            mean_activation,
+            active_fraction,
+        },
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CellularKernelSample {
+    offset_x: isize,
+    offset_y: isize,
+    weight: f32,
+}
+
+fn compile_cellular_kernels(
+    settings: &CellularAutomataSettings,
+) -> std::result::Result<Vec<Vec<CellularKernelSample>>, String> {
+    let kernel_size = settings.kernel_size;
+    if kernel_size < 3
+        || kernel_size.is_multiple_of(2)
+        || settings.kernel.len() != kernel_size * kernel_size
+    {
+        return Err("Cellular automata kernel must be an odd square of at least 3 x 3.".to_owned());
+    }
+
+    let kernel_radius = (kernel_size / 2) as isize;
+    let kernel_scale: f32 = settings.kernel.iter().map(|weight| weight.abs()).sum();
+    if kernel_scale <= f32::EPSILON {
+        return Err("Cellular automata kernel must contain at least one non-zero cell.".to_owned());
+    }
+
+    let base_samples = settings
+        .kernel
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, weight)| weight.abs() > f32::EPSILON)
+        .map(|(index, weight)| {
+            let x = (index % kernel_size) as isize - kernel_radius;
+            let y = (index / kernel_size) as isize - kernel_radius;
+            (x, y, weight / kernel_scale)
+        })
+        .collect::<Vec<_>>();
+    let turns = if settings.omni_directional { 4 } else { 1 };
+    let mut kernels = Vec::with_capacity(turns);
+
+    for turn in 0..turns {
+        let mut rotated = base_samples
+            .iter()
+            .map(|(offset_x, offset_y, weight)| {
+                let (offset_x, offset_y) = rotate_kernel_offset(*offset_x, *offset_y, turn);
+                CellularKernelSample {
+                    offset_x,
+                    offset_y,
+                    weight: *weight,
+                }
+            })
+            .collect::<Vec<_>>();
+        rotated.sort_by_key(|sample| (sample.offset_y, sample.offset_x));
+        if !kernels.contains(&rotated) {
+            kernels.push(rotated);
+        }
+    }
+
+    Ok(kernels)
+}
+
+fn rotate_kernel_offset(x: isize, y: isize, turn: usize) -> (isize, isize) {
+    match turn % 4 {
+        0 => (x, y),
+        1 => (-y, x),
+        2 => (-x, -y),
+        _ => (y, -x),
+    }
+}
+
+fn cellular_growth_response(sensed: f32, settings: &CellularAutomataSettings) -> f32 {
+    let center = settings.response_center.clamp(-1.0, 1.0);
+    let width = settings.response_width.clamp(0.001, 2.0);
+
+    match settings.response {
+        CellularAutomataResponse::Gaussian => {
+            let distance = (sensed - center) / width;
+            2.0 * (-0.5 * distance * distance).exp() - 1.0
+        }
+        CellularAutomataResponse::Band => {
+            let edge_distance = width - (sensed - center).abs();
+            (edge_distance / (width * 0.15).max(0.005)).tanh()
+        }
+        CellularAutomataResponse::Threshold => ((sensed - center) / width.max(0.005)).tanh(),
+        CellularAutomataResponse::LowThreshold => ((center - sensed) / width.max(0.005)).tanh(),
+    }
+}
+
+fn reflect_coordinate(coordinate: isize, length: usize) -> usize {
+    if length <= 1 {
+        return 0;
+    }
+
+    let period = 2 * (length as isize - 1);
+    let wrapped = coordinate.rem_euclid(period);
+    if wrapped < length as isize {
+        wrapped as usize
+    } else {
+        (period - wrapped) as usize
+    }
+}
+
 fn histogram_from_values(
     values: impl Iterator<Item = u32>,
     bin_count: usize,
@@ -667,6 +951,7 @@ fn process_values(
     value_range: u64,
     display_max: u32,
     source_description: &str,
+    cellular_automata: Option<(ColorImage, CellularAutomataSummary)>,
 ) -> ProcessedImage {
     let mut min_value = u32::MAX;
     let mut max_value = u32::MIN;
@@ -694,6 +979,10 @@ fn process_values(
         max_value = 0;
     }
 
+    let (cellular_automata_overlay, cellular_automata_summary) = cellular_automata
+        .map(|(overlay, summary)| (Some(overlay), Some(summary)))
+        .unwrap_or((None, None));
+
     ProcessedImage {
         size: Vec2::new(size[0] as f32, size[1] as f32),
         color_image: ColorImage::from_rgba_unmultiplied(size, &rgba),
@@ -706,6 +995,8 @@ fn process_values(
         },
         bin_indices,
         bin_count,
+        cellular_automata_overlay,
+        cellular_automata_summary,
     }
 }
 
@@ -742,6 +1033,135 @@ mod tests {
     }
 
     #[test]
+    fn cellular_automata_extinguishes_unsupported_activation() {
+        let values = vec![0, 32, 64, 96, 128, 160, 192, 224, 255];
+        let settings = CellularAutomataSettings {
+            kernel_size: 3,
+            kernel: vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            seed_mode: CellularAutomataSeedMode::Bright,
+            response: CellularAutomataResponse::Gaussian,
+            response_center: -1.0,
+            response_width: 0.01,
+            decay_rate: 0.25,
+            time_step: 0.2,
+            iterations: 5,
+            ..CellularAutomataSettings::default()
+        };
+
+        let (state, summary) = evolve_cellular_automata(&values, 3, 3, &settings).unwrap();
+
+        assert!(state.iter().sum::<f32>() / (state.len() as f32) < 0.1);
+        assert_eq!(summary.iterations_run, 5);
+        assert!(summary.active_fraction < 0.2);
+    }
+
+    #[test]
+    fn cellular_automata_preserves_supported_activation() {
+        let values = vec![0, 0, 0, 0, 255, 0, 0, 0, 0];
+        let settings = CellularAutomataSettings {
+            kernel_size: 3,
+            kernel: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+            seed_mode: CellularAutomataSeedMode::Bright,
+            response: CellularAutomataResponse::Threshold,
+            response_center: 0.2,
+            response_width: 0.01,
+            decay_rate: 0.0,
+            time_step: 0.1,
+            iterations: 4,
+            ..CellularAutomataSettings::default()
+        };
+
+        let (state, _) = evolve_cellular_automata(&values, 3, 3, &settings).unwrap();
+
+        assert!(state[4] > 0.9);
+        assert!(
+            state
+                .iter()
+                .enumerate()
+                .all(|(index, value)| index == 4 || *value < 0.01)
+        );
+    }
+
+    #[test]
+    fn low_pass_threshold_inverts_high_pass_threshold_response() {
+        let high_pass = CellularAutomataSettings {
+            response: CellularAutomataResponse::Threshold,
+            response_center: 0.2,
+            response_width: 0.05,
+            ..CellularAutomataSettings::default()
+        };
+        let low_pass = CellularAutomataSettings {
+            response: CellularAutomataResponse::LowThreshold,
+            ..high_pass.clone()
+        };
+
+        assert!(cellular_growth_response(0.0, &high_pass) < 0.0);
+        assert!(cellular_growth_response(0.0, &low_pass) > 0.0);
+        assert!(cellular_growth_response(0.4, &high_pass) > 0.0);
+        assert!(cellular_growth_response(0.4, &low_pass) < 0.0);
+    }
+
+    #[test]
+    fn omni_directional_kernel_passes_collapse_by_cardinal_symmetry() {
+        let mut disk = CellularAutomataSettings {
+            kernel_size: 3,
+            kernel: vec![0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0],
+            omni_directional: true,
+            ..CellularAutomataSettings::default()
+        };
+        assert_eq!(compile_cellular_kernels(&disk).unwrap().len(), 1);
+
+        disk.kernel = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        assert_eq!(compile_cellular_kernels(&disk).unwrap().len(), 2);
+
+        disk.kernel = vec![0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        assert_eq!(compile_cellular_kernels(&disk).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn cellular_automata_rejects_an_empty_kernel() {
+        let values = vec![0; 9];
+        let settings = CellularAutomataSettings {
+            kernel_size: 3,
+            kernel: vec![0.0; 9],
+            ..CellularAutomataSettings::default()
+        };
+
+        let error = evolve_cellular_automata(&values, 3, 3, &settings).unwrap_err();
+
+        assert!(error.contains("non-zero cell"));
+    }
+
+    #[test]
+    fn rotates_gray_plane_without_changing_pixel_values() {
+        let make_plane = || GrayPlane {
+            width: 3,
+            height: 2,
+            values: vec![1, 2, 3, 4, 5, 6],
+            alpha: vec![11, 12, 13, 14, 15, 16],
+            value_range: 256,
+            max_value: 255,
+            source_description: "test".to_owned(),
+        };
+
+        let mut clockwise = make_plane();
+        rotate_gray_plane(&mut clockwise, ImageRotation::Clockwise90);
+        assert_eq!((clockwise.width, clockwise.height), (2, 3));
+        assert_eq!(clockwise.values, vec![4, 1, 5, 2, 6, 3]);
+        assert_eq!(clockwise.alpha, vec![14, 11, 15, 12, 16, 13]);
+
+        let mut half_turn = make_plane();
+        rotate_gray_plane(&mut half_turn, ImageRotation::HalfTurn);
+        assert_eq!((half_turn.width, half_turn.height), (3, 2));
+        assert_eq!(half_turn.values, vec![6, 5, 4, 3, 2, 1]);
+
+        let mut counter_clockwise = make_plane();
+        rotate_gray_plane(&mut counter_clockwise, ImageRotation::Clockwise270);
+        assert_eq!((counter_clockwise.width, counter_clockwise.height), (2, 3));
+        assert_eq!(counter_clockwise.values, vec![3, 6, 2, 5, 1, 4]);
+    }
+
+    #[test]
     #[ignore = "requires the local RELION float TIFF fixture"]
     fn decodes_relion_float_tiff_fixture() {
         let path = Path::new(
@@ -756,5 +1176,33 @@ mod tests {
         assert_eq!(plane.value_range, 65_536);
         assert_eq!(plane.max_value, 65_535);
         assert!(plane.source_description.contains("32-bit float grayscale"));
+    }
+
+    #[test]
+    #[ignore = "requires the local RELION float TIFF fixture"]
+    fn evolves_cellular_automata_on_relion_float_tiff_fixture() {
+        let path = Path::new(
+            "data/raw/motion-corrected/AAG-MC_mics/FoilHole_17243830_Data_17242991_17242993_20210817_164930_Fractions.tif",
+        );
+        if !path.exists() {
+            return;
+        }
+
+        let plane = decode_gray_plane(path).expect("float TIFF should decode through fallback");
+        let (state, summary) = evolve_cellular_automata(
+            &plane.values,
+            plane.width,
+            plane.height,
+            &CellularAutomataSettings::default(),
+        )
+        .expect("default cellular automata settings should evolve");
+
+        assert_eq!(state.len(), plane.width * plane.height);
+        assert!(summary.iterations_run > 0);
+        assert!(
+            summary.active_fraction > 0.0 && summary.active_fraction < 1.0,
+            "default feature selection should be non-empty and selective: {summary:?}"
+        );
+        assert!(state.iter().all(|value| (0.0..=1.0).contains(value)));
     }
 }

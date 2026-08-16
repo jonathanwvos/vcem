@@ -5,7 +5,7 @@ use eframe::{
         Rect, ScrollArea, Sense, TextureOptions, Ui, Vec2,
     },
 };
-use egui_plot::{Bar, BarChart, Plot};
+use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints, PlotUi};
 use std::{
     collections::BTreeSet,
     fs,
@@ -16,7 +16,9 @@ use std::{
 
 use crate::analysis::{intensity_histogram_from_path, processed_image_from_path};
 use crate::types::{
-    DenoiseMethod, DenoiseSettings, DisplayedImage, ImageFile, IntensityHistogram, ProcessedImage,
+    CellularAutomataResponse, CellularAutomataSeedMode, CellularAutomataSettings, DenoiseMethod,
+    DenoiseSettings, DisplayedImage, ExperimentConfiguration, ImageFile, ImageRotation,
+    IntensityHistogram, ProcessedImage,
 };
 
 pub struct VCEMApp {
@@ -38,9 +40,12 @@ pub struct VCEMApp {
     histogram: Option<IntensityHistogram>,
     histogram_error: Option<String>,
     reset_histogram_view: bool,
+    reset_cellular_response_view: bool,
     selected_histogram_bins: BTreeSet<usize>,
     image_selection_start: Option<Pos2>,
     histogram_selection_start_bin: Option<usize>,
+    rotation: ImageRotation,
+    applied_rotation: ImageRotation,
     denoise_method: DenoiseMethod,
     denoise_kernel_size: usize,
     applied_denoise: Option<DenoiseSettings>,
@@ -50,6 +55,14 @@ pub struct VCEMApp {
     applied_equalization: Option<f64>,
     gamma_value: f64,
     applied_gamma: Option<f64>,
+    cellular_automata_settings: CellularAutomataSettings,
+    applied_cellular_automata: Option<CellularAutomataSettings>,
+    cellular_kernel_preset: CellularKernelPreset,
+    cellular_kernel_angle: f32,
+    configuration_path: String,
+    saved_configuration: Option<ExperimentConfiguration>,
+    configuration_notice: Option<String>,
+    configuration_error: Option<String>,
     processing_job: Option<ProcessingJob>,
     next_processing_job_id: u64,
 }
@@ -76,43 +89,27 @@ struct ProcessingResult {
     result: std::result::Result<ProcessedImage, String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ProcessingKind {
-    Preview {
-        denoise: Option<DenoiseSettings>,
-        invert: bool,
-        equalization: Option<f64>,
-        gamma: Option<f64>,
-        bin_count: usize,
-    },
-    Denoise {
-        denoise: Option<DenoiseSettings>,
-        invert: bool,
-        equalization: Option<f64>,
-        gamma: Option<f64>,
-        bin_count: usize,
-    },
-    Invert {
-        denoise: Option<DenoiseSettings>,
-        invert: bool,
-        equalization: Option<f64>,
-        gamma: Option<f64>,
-        bin_count: usize,
-    },
-    Equalize {
-        denoise: Option<DenoiseSettings>,
-        invert: bool,
-        equalization: Option<f64>,
-        gamma: Option<f64>,
-        bin_count: usize,
-    },
-    Gamma {
-        denoise: Option<DenoiseSettings>,
-        invert: bool,
-        equalization: Option<f64>,
-        gamma: f64,
-        bin_count: usize,
-    },
+    Preview(ExperimentConfiguration),
+    Rotation(ExperimentConfiguration),
+    Denoise(ExperimentConfiguration),
+    Invert(ExperimentConfiguration),
+    Equalize(ExperimentConfiguration),
+    Gamma(ExperimentConfiguration),
+    CellularAutomata(ExperimentConfiguration),
+    Configuration(ExperimentConfiguration),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellularKernelPreset {
+    Custom,
+    Disk,
+    Ring,
+    Line,
+    Cross,
+    Crescent,
+    Clear,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,9 +127,12 @@ enum ViewMode {
 
 impl VCEMApp {
     pub fn new(_: &CreationContext<'_>) -> Self {
-        let image_picker_dir = std::env::current_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default();
+        let current_dir = std::env::current_dir().unwrap_or_default();
+        let image_picker_dir = current_dir.display().to_string();
+        let configuration_path = current_dir
+            .join("vcem-experiment.json")
+            .display()
+            .to_string();
 
         Self {
             upper_panel_expanded: true,
@@ -153,9 +153,12 @@ impl VCEMApp {
             histogram: None,
             histogram_error: None,
             reset_histogram_view: false,
+            reset_cellular_response_view: false,
             selected_histogram_bins: BTreeSet::new(),
             image_selection_start: None,
             histogram_selection_start_bin: None,
+            rotation: ImageRotation::None,
+            applied_rotation: ImageRotation::None,
             denoise_method: DenoiseMethod::None,
             denoise_kernel_size: 3,
             applied_denoise: None,
@@ -165,6 +168,14 @@ impl VCEMApp {
             applied_equalization: None,
             gamma_value: 1.0,
             applied_gamma: None,
+            cellular_automata_settings: CellularAutomataSettings::default(),
+            applied_cellular_automata: None,
+            cellular_kernel_preset: CellularKernelPreset::Disk,
+            cellular_kernel_angle: 0.0,
+            configuration_path,
+            saved_configuration: None,
+            configuration_notice: None,
+            configuration_error: None,
             processing_job: None,
             next_processing_job_id: 1,
         }
@@ -290,6 +301,12 @@ impl VCEMApp {
                         self.equalization_strength = 0.0;
                         self.applied_equalization = None;
                         self.applied_gamma = None;
+                        self.rotation = ImageRotation::None;
+                        self.applied_rotation = ImageRotation::None;
+                        self.cellular_automata_settings = CellularAutomataSettings::default();
+                        self.applied_cellular_automata = None;
+                        self.cellular_kernel_preset = CellularKernelPreset::Disk;
+                        self.cellular_kernel_angle = 0.0;
                         self.processing_job = None;
                     }
                 }
@@ -302,188 +319,556 @@ impl VCEMApp {
             .default_size(240.0)
             .min_size(160.0)
             .show(ui, |ui| {
-                ui.heading("Analysis");
-                ui.separator();
-
-                if let Some(image) = self.selected_image.and_then(|index| self.images.get(index)) {
-                    let is_processing = self.processing_job.is_some();
-
-                    ui.label(format!("File: {}", image.name));
-                    if let Some(displayed) = self
-                        .displayed_image
-                        .as_ref()
-                        .filter(|displayed| Some(displayed.image_index) == self.selected_image)
-                    {
-                        ui.label(format!(
-                            "Size: {} x {}",
-                            displayed.size.x as usize, displayed.size.y as usize
-                        ));
-                    } else {
-                        ui.label("Size: not loaded");
-                    }
-                    if let Some(job) = &self.processing_job {
-                        ui.label(format!("Processing {}...", job.kind.label()));
-                    }
-
-                    ui.add_space(5.0);
-                    ui.heading("Image Augmentations");
+                ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Analysis");
                     ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.has_image_augmentation_state() || is_processing,
-                            Button::new("Reset All Augmentations"),
-                        )
-                        .clicked()
-                    {
-                        self.reset_image_augmentations(ui.ctx());
-                    }
 
-                    ui.add_space(5.0);
-                    ui.heading("Intensity Histogram");
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Bin count");
-                        let response = ui.add(
-                            DragValue::new(&mut self.histogram_bin_count)
-                                .range(2..=4096)
-                                .speed(1),
-                        );
-                        if response.changed() {
-                            self.displayed_image = None;
-                            self.histogram = None;
-                            self.histogram_error = None;
-                            self.clear_histogram_highlight();
-                            self.processing_job = None;
-                            self.reset_histogram_view = true;
+                    if let Some(image) =
+                        self.selected_image.and_then(|index| self.images.get(index))
+                    {
+                        let is_processing = self.processing_job.is_some();
+
+                        ui.label(format!("File: {}", image.name));
+                        if let Some(displayed) = self
+                            .displayed_image
+                            .as_ref()
+                            .filter(|displayed| Some(displayed.image_index) == self.selected_image)
+                        {
+                            ui.label(format!(
+                                "Size: {} x {}",
+                                displayed.size.x as usize, displayed.size.y as usize
+                            ));
+                        } else {
+                            ui.label("Size: not loaded");
                         }
-                    });
+                        if let Some(job) = &self.processing_job {
+                            ui.label(format!("Processing {}...", job.kind.label()));
+                        }
 
-                    if ui
-                        .add_enabled(!is_processing, Button::new("Create Histogram"))
-                        .clicked()
-                    {
-                        self.create_intensity_histogram();
-                    }
+                        ui.add_space(5.0);
+                        ui.heading("Image Augmentations");
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.has_image_augmentation_state() || is_processing,
+                                Button::new("Reset All Augmentations"),
+                            )
+                            .on_hover_text("Restores the current image to its unaugmented state.")
+                            .clicked()
+                        {
+                            self.reset_image_augmentations(ui.ctx());
+                        }
 
-                    if let Some(error) = &self.histogram_error {
-                        ui.colored_label(ui.visuals().error_fg_color, error);
-                    }
+                        ui.add_space(8.0);
+                        self.show_rotation_controls(ui, is_processing);
 
-                    if let Some(histogram) = self.histogram.clone() {
-                        ui.label(format!(
-                            "{} pixels, {}, range {}..{}",
-                            histogram.pixel_count,
-                            histogram.source_description,
-                            histogram.min_value,
-                            histogram.max_value
-                        ));
-                        self.show_histogram_zoom_controls(ui, &histogram);
-                        self.show_histogram_plot(ui, &histogram);
-                    }
+                        ui.add_space(8.0);
+                        self.show_configuration_controls(ui, is_processing);
 
-                    ui.add_space(8.0);
-                    ui.heading("Denoising");
-                    ui.separator();
-                    egui::ComboBox::from_label("Method")
-                        .selected_text(self.denoise_method.label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.denoise_method,
-                                DenoiseMethod::None,
-                                DenoiseMethod::None.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.denoise_method,
-                                DenoiseMethod::Median,
-                                DenoiseMethod::Median.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.denoise_method,
-                                DenoiseMethod::Gaussian,
-                                DenoiseMethod::Gaussian.label(),
-                            );
+                        ui.add_space(5.0);
+                        ui.heading("Intensity Histogram");
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Bin count");
+                            let response = ui.add(
+                                DragValue::new(&mut self.histogram_bin_count)
+                                    .range(2..=4096)
+                                    .speed(1),
+                            )
+                            .on_hover_text("Controls how finely intensities are divided into bins.");
+                            if response.changed() {
+                                self.displayed_image = None;
+                                self.histogram = None;
+                                self.histogram_error = None;
+                                self.clear_histogram_highlight();
+                                self.processing_job = None;
+                                self.reset_histogram_view = true;
+                            }
                         });
 
-                    match self.denoise_method {
-                        DenoiseMethod::None => {
-                            ui.label("No denoising will be applied.");
+                        if ui
+                            .add_enabled(!is_processing, Button::new("Create Histogram"))
+                            .on_hover_text("Builds the intensity distribution for the current processed image.")
+                            .clicked()
+                        {
+                            self.create_intensity_histogram();
                         }
-                        DenoiseMethod::Median | DenoiseMethod::Gaussian => {
-                            ui.horizontal(|ui| {
-                                ui.label("Kernel");
-                                ui.selectable_value(&mut self.denoise_kernel_size, 3, "3");
-                                ui.selectable_value(&mut self.denoise_kernel_size, 5, "5");
-                                ui.selectable_value(&mut self.denoise_kernel_size, 7, "7");
-                            });
+
+                        if let Some(error) = &self.histogram_error {
+                            ui.colored_label(ui.visuals().error_fg_color, error);
                         }
-                    }
 
-                    if ui
-                        .add_enabled(!is_processing, Button::new("Apply Denoising"))
-                        .clicked()
-                    {
-                        self.apply_denoising(ui.ctx());
-                    }
+                        if let Some(histogram) = self.histogram.clone() {
+                            ui.label(format!(
+                                "{} pixels, {}, range {}..{}",
+                                histogram.pixel_count,
+                                histogram.source_description,
+                                histogram.min_value,
+                                histogram.max_value
+                            ));
+                            self.show_histogram_zoom_controls(ui, &histogram);
+                            self.show_histogram_plot(ui, &histogram);
+                        }
 
-                    ui.add_space(8.0);
-                    ui.heading("Inversion");
-                    ui.separator();
-                    ui.checkbox(&mut self.invert_values, "Invert values");
-                    if ui
-                        .add_enabled(
-                            !is_processing && self.invert_values != self.applied_invert,
-                            Button::new("Apply Inversion"),
-                        )
-                        .clicked()
-                    {
-                        self.apply_inversion(ui.ctx());
-                    }
+                        ui.add_space(8.0);
+                        ui.heading("Denoising");
+                        ui.separator();
+                        egui::ComboBox::from_label("Method")
+                            .selected_text(self.denoise_method.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.denoise_method,
+                                    DenoiseMethod::None,
+                                    DenoiseMethod::None.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut self.denoise_method,
+                                    DenoiseMethod::Median,
+                                    DenoiseMethod::Median.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut self.denoise_method,
+                                    DenoiseMethod::Gaussian,
+                                    DenoiseMethod::Gaussian.label(),
+                                );
+                            })
+                            .response
+                            .on_hover_text("Chooses the local denoising operation to apply before later augmentations.");
 
-                    ui.add_space(8.0);
-                    ui.heading("Distribution Equalization");
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Strength");
-                        ui.add(
-                            egui::Slider::new(&mut self.equalization_strength, 0.0..=1.0)
-                                .show_value(true),
-                        );
-                    });
-                    if ui
-                        .add_enabled(
-                            !is_processing
-                                && Some(self.equalization_strength) != self.applied_equalization
-                                && (self.equalization_strength > 0.0
-                                    || self.applied_equalization.is_some()),
-                            Button::new("Apply Equalization"),
-                        )
-                        .clicked()
-                    {
-                        self.apply_equalization(ui.ctx());
-                    }
+                        match self.denoise_method {
+                            DenoiseMethod::None => {
+                                ui.label("No denoising will be applied.");
+                            }
+                            DenoiseMethod::Median | DenoiseMethod::Gaussian => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Kernel");
+                                    ui.selectable_value(&mut self.denoise_kernel_size, 3, "3")
+                                        .on_hover_text("Smallest denoise neighbourhood; preserves finer details.");
+                                    ui.selectable_value(&mut self.denoise_kernel_size, 5, "5")
+                                        .on_hover_text("Moderate denoise neighbourhood.");
+                                    ui.selectable_value(&mut self.denoise_kernel_size, 7, "7")
+                                        .on_hover_text("Largest denoise neighbourhood; smooths more aggressively.");
+                                });
+                            }
+                        }
 
-                    ui.add_space(8.0);
-                    ui.heading("Gamma Adjustment");
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Gamma");
-                        ui.add(
-                            DragValue::new(&mut self.gamma_value)
-                                .range(0.001..=4.0)
-                                .speed(0.01),
-                        );
-                    });
+                        if ui
+                            .add_enabled(!is_processing, Button::new("Apply Denoising"))
+                            .on_hover_text("Applies the selected denoise method to the current image.")
+                            .clicked()
+                        {
+                            self.apply_denoising(ui.ctx());
+                        }
 
-                    if ui
-                        .add_enabled(!is_processing, Button::new("Apply Gamma Adjustment"))
-                        .clicked()
-                    {
-                        self.apply_gamma_adjustment(ui.ctx());
+                        ui.add_space(8.0);
+                        ui.heading("Inversion");
+                        ui.separator();
+                        ui.checkbox(&mut self.invert_values, "Invert values")
+                            .on_hover_text("Swaps low and high intensities before later processing.");
+                        if ui
+                            .add_enabled(
+                                !is_processing && self.invert_values != self.applied_invert,
+                                Button::new("Apply Inversion"),
+                            )
+                            .on_hover_text("Applies or removes intensity inversion.")
+                            .clicked()
+                        {
+                            self.apply_inversion(ui.ctx());
+                        }
+
+                        ui.add_space(8.0);
+                        ui.heading("Distribution Equalization");
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Strength");
+                            ui.add(
+                                egui::Slider::new(&mut self.equalization_strength, 0.0..=1.0)
+                                    .show_value(true),
+                            )
+                            .on_hover_text("Spreads occupied intensity values across more of the available range.");
+                        });
+                        if ui
+                            .add_enabled(
+                                !is_processing
+                                    && Some(self.equalization_strength)
+                                        != self.applied_equalization
+                                    && (self.equalization_strength > 0.0
+                                        || self.applied_equalization.is_some()),
+                                Button::new("Apply Equalization"),
+                            )
+                            .on_hover_text("Applies the selected distribution equalization strength.")
+                            .clicked()
+                        {
+                            self.apply_equalization(ui.ctx());
+                        }
+
+                        ui.add_space(8.0);
+                        ui.heading("Gamma Adjustment");
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Gamma");
+                            ui.add(
+                                DragValue::new(&mut self.gamma_value)
+                                    .range(0.001..=4.0)
+                                    .speed(0.01),
+                            )
+                            .on_hover_text("Adjusts contrast nonlinearly while preserving intensity ordering.");
+                        });
+
+                        if ui
+                            .add_enabled(!is_processing, Button::new("Apply Gamma Adjustment"))
+                            .on_hover_text("Applies the selected gamma value to the current image.")
+                            .clicked()
+                        {
+                            self.apply_gamma_adjustment(ui.ctx());
+                        }
+
+                        ui.add_space(8.0);
+                        self.show_cellular_automata_controls(ui, is_processing);
+                    } else {
+                        ui.label("Analytical results live here.");
                     }
-                } else {
-                    ui.label("Analytical results live here.");
-                }
+                });
             });
+    }
+
+    fn show_rotation_controls(&mut self, ui: &mut Ui, is_processing: bool) {
+        ui.heading("Rotation");
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            for rotation in ImageRotation::ALL {
+                ui.selectable_value(&mut self.rotation, rotation, rotation.label())
+                    .on_hover_text(
+                        "Chooses the image orientation used by all downstream analysis.",
+                    );
+            }
+        });
+        if ui
+            .add_enabled(
+                !is_processing && self.rotation != self.applied_rotation,
+                Button::new("Apply Rotation"),
+            )
+            .on_hover_text("Rotates the image and rebuilds derived analysis data.")
+            .clicked()
+        {
+            self.apply_rotation(ui.ctx());
+        }
+    }
+
+    fn show_configuration_controls(&mut self, ui: &mut Ui, is_processing: bool) {
+        ui.heading("Experiment Configuration");
+        ui.separator();
+        ui.add(
+            egui::TextEdit::singleline(&mut self.configuration_path)
+                .hint_text("Configuration path"),
+        )
+        .on_hover_text("Path used when saving or loading the experiment configuration.");
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !is_processing && self.displayed_image.is_some(),
+                    Button::new("Save Applied"),
+                )
+                .on_hover_text("Saves the currently applied augmentation and CA settings.")
+                .clicked()
+            {
+                self.save_applied_configuration();
+            }
+            if ui
+                .add_enabled(!is_processing, Button::new("Load"))
+                .on_hover_text("Loads an experiment configuration from the configured path.")
+                .clicked()
+            {
+                self.load_configuration();
+            }
+            if ui
+                .add_enabled(
+                    !is_processing
+                        && self.selected_image.is_some()
+                        && self.saved_configuration.is_some(),
+                    Button::new("Apply Saved"),
+                )
+                .on_hover_text("Runs the loaded configuration on the selected image.")
+                .clicked()
+            {
+                self.apply_saved_configuration(ui.ctx());
+            }
+        });
+        if let Some(notice) = &self.configuration_notice {
+            ui.label(notice);
+        }
+        if let Some(error) = &self.configuration_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+    }
+
+    fn show_cellular_automata_controls(&mut self, ui: &mut Ui, is_processing: bool) {
+        ui.heading("Cellular Feature Filter");
+        ui.separator();
+
+        egui::ComboBox::from_label("Seed polarity")
+            .selected_text(self.cellular_automata_settings.seed_mode.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.cellular_automata_settings.seed_mode,
+                    CellularAutomataSeedMode::Dark,
+                    CellularAutomataSeedMode::Dark.label(),
+                );
+                ui.selectable_value(
+                    &mut self.cellular_automata_settings.seed_mode,
+                    CellularAutomataSeedMode::Bright,
+                    CellularAutomataSeedMode::Bright.label(),
+                );
+            })
+            .response
+            .on_hover_text(
+                "Selects which intensity polarity becomes the initial feature evidence.",
+            );
+
+        ui.collapsing("Sensing Kernel", |ui| {
+            let old_size = self.cellular_automata_settings.kernel_size;
+            let mut new_size = old_size;
+            egui::ComboBox::from_label("Size")
+                .selected_text(format!("{old_size} x {old_size}"))
+                .show_ui(ui, |ui| {
+                    for size in (3..=15).step_by(2) {
+                        ui.selectable_value(&mut new_size, size, format!("{size} x {size}"));
+                    }
+                })
+                .response
+                .on_hover_text("Sets the local neighbourhood size sampled around each pixel.");
+            if new_size != old_size {
+                resize_cellular_kernel(&mut self.cellular_automata_settings, new_size);
+                self.cellular_kernel_preset = CellularKernelPreset::Custom;
+            }
+
+            let previous_preset = self.cellular_kernel_preset;
+            egui::ComboBox::from_label("Preset")
+                .selected_text(self.cellular_kernel_preset.label())
+                .show_ui(ui, |ui| {
+                    for preset in CellularKernelPreset::ALL {
+                        ui.selectable_value(
+                            &mut self.cellular_kernel_preset,
+                            preset,
+                            preset.label(),
+                        );
+                    }
+                })
+                .response
+                .on_hover_text("Seeds the kernel editor with common sensing shapes.");
+            if self.cellular_kernel_preset != previous_preset {
+                apply_cellular_kernel_preset(
+                    &mut self.cellular_automata_settings,
+                    self.cellular_kernel_preset,
+                    self.cellular_kernel_angle,
+                );
+            }
+            if matches!(
+                self.cellular_kernel_preset,
+                CellularKernelPreset::Line | CellularKernelPreset::Crescent
+            ) {
+                let angle_changed = ui
+                    .add(
+                        egui::Slider::new(&mut self.cellular_kernel_angle, 0.0..=180.0)
+                            .text("Angle")
+                            .suffix(" degrees"),
+                    )
+                    .on_hover_text("Rotates directional presets before applying the filter.")
+                    .changed();
+                if angle_changed {
+                    apply_cellular_kernel_preset(
+                        &mut self.cellular_automata_settings,
+                        self.cellular_kernel_preset,
+                        self.cellular_kernel_angle,
+                    );
+                }
+            }
+            ui.checkbox(
+                &mut self.cellular_automata_settings.omni_directional,
+                "Omni-directional pass",
+            )
+            .on_hover_text(
+                "Tests cardinal rotations of asymmetric kernels in each iteration and keeps the strongest response.",
+            );
+
+            ui.add_space(4.0);
+            let size = self.cellular_automata_settings.kernel_size;
+            let cell_size = (ui.available_width() / size as f32 - 2.0).clamp(12.0, 24.0);
+            for y in 0..size {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for x in 0..size {
+                        let index = y * size + x;
+                        let weight = self.cellular_automata_settings.kernel[index];
+                        let fill = if weight > 0.0 {
+                            Color32::from_rgb(27, 132, 122)
+                        } else if weight < 0.0 {
+                            Color32::from_rgb(177, 71, 80)
+                        } else {
+                            ui.visuals().widgets.inactive.bg_fill
+                        };
+                        let symbol = if weight > 0.0 {
+                            "+"
+                        } else if weight < 0.0 {
+                            "-"
+                        } else {
+                            ""
+                        };
+                        let response = ui
+                            .add_sized([cell_size, cell_size], Button::new(symbol).fill(fill))
+                            .on_hover_text("Left click: + / - / 0. Right click: reverse.");
+                        if response.clicked_by(PointerButton::Primary) {
+                            self.cellular_automata_settings.kernel[index] =
+                                next_kernel_weight(weight, false);
+                            self.cellular_kernel_preset = CellularKernelPreset::Custom;
+                        } else if response.clicked_by(PointerButton::Secondary) {
+                            self.cellular_automata_settings.kernel[index] =
+                                next_kernel_weight(weight, true);
+                            self.cellular_kernel_preset = CellularKernelPreset::Custom;
+                        }
+                    }
+                });
+            }
+        });
+
+        ui.collapsing("Growth Response", |ui| {
+            egui::ComboBox::from_label("Response")
+                .selected_text(self.cellular_automata_settings.response.label())
+                .show_ui(ui, |ui| {
+                    for response in CellularAutomataResponse::ALL {
+                        ui.selectable_value(
+                            &mut self.cellular_automata_settings.response,
+                            response,
+                            response.label(),
+                        );
+                    }
+                })
+                .response
+                .on_hover_text("Maps the sensed kernel value to growth or suppression.");
+            ui.add(
+                egui::Slider::new(
+                    &mut self.cellular_automata_settings.response_center,
+                    -1.0..=1.0,
+                )
+                .text("Centre"),
+            )
+            .on_hover_text("Moves the target sensed value along the response curve.");
+            ui.add(
+                egui::Slider::new(
+                    &mut self.cellular_automata_settings.response_width,
+                    0.01..=1.0,
+                )
+                .text("Width"),
+            )
+            .on_hover_text("Controls how broad or selective the response curve is.");
+            if ui
+                .button("Reset")
+                .on_hover_text("Restores the response plot view bounds.")
+                .clicked()
+            {
+                self.reset_cellular_response_view = true;
+            }
+
+            let response_points = PlotPoints::from_iter((-100..=100).map(|sample| {
+                let sensed = sample as f64 / 100.0;
+                [
+                    sensed,
+                    cellular_response_preview(sensed as f32, &self.cellular_automata_settings)
+                        as f64,
+                ]
+            }));
+            let mut plot = Plot::new("cellular_growth_response")
+                .height(110.0)
+                .include_x(-1.0)
+                .include_x(1.0)
+                .include_y(-1.0)
+                .include_y(1.0)
+                .allow_drag(true)
+                .pan_pointer_button(PointerButton::Secondary)
+                .allow_scroll(false)
+                .allow_zoom(true)
+                .allow_boxed_zoom(false)
+                .allow_axis_zoom_drag(false);
+
+            if self.reset_cellular_response_view {
+                plot = plot.reset();
+                self.reset_cellular_response_view = false;
+            }
+
+            plot.show(ui, |plot_ui| {
+                plot_ui.line(
+                    Line::new("Growth", response_points).color(Color32::from_rgb(30, 210, 190)),
+                );
+                zoom_hovered_plot_with_scroll(plot_ui);
+            });
+        });
+
+        ui.collapsing("Evolution", |ui| {
+            ui.add(
+                egui::Slider::new(&mut self.cellular_automata_settings.growth_rate, 0.0..=2.0)
+                    .text("Growth"),
+            )
+            .on_hover_text("Scales positive response into activation growth.");
+            ui.add(
+                egui::Slider::new(&mut self.cellular_automata_settings.decay_rate, 0.0..=2.0)
+                    .text("Decay"),
+            )
+            .on_hover_text("Controls how quickly unsupported activation fades.");
+            ui.add(
+                egui::Slider::new(&mut self.cellular_automata_settings.time_step, 0.01..=0.5)
+                    .text("Time step"),
+            )
+            .on_hover_text("Sets the amount of CA state change applied per step.");
+            ui.add(
+                egui::Slider::new(&mut self.cellular_automata_settings.iterations, 1..=128)
+                    .text("Duration"),
+            )
+            .on_hover_text("Sets the maximum number of synchronous CA steps to run.");
+        });
+
+        if let Some(summary) = self
+            .displayed_image
+            .as_ref()
+            .and_then(|displayed| displayed.cellular_automata_summary)
+        {
+            let state = if summary.converged {
+                "converged"
+            } else {
+                "duration reached"
+            };
+            ui.label(format!(
+                "{:.1}% active, mean {:.3}, {} after {} steps",
+                summary.active_fraction * 100.0,
+                summary.mean_activation,
+                state,
+                summary.iterations_run
+            ));
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            let settings_changed =
+                self.applied_cellular_automata.as_ref() != Some(&self.cellular_automata_settings);
+            if ui
+                .add_enabled(
+                    !is_processing && settings_changed,
+                    Button::new("Apply Feature Filter"),
+                )
+                .on_hover_text("Runs the CA feature filter and renders its overlay.")
+                .clicked()
+            {
+                self.apply_cellular_automata(ui.ctx(), true);
+            }
+            if ui
+                .add_enabled(
+                    !is_processing && self.applied_cellular_automata.is_some(),
+                    Button::new("Remove Overlay"),
+                )
+                .on_hover_text("Removes the CA overlay while keeping other applied augmentations.")
+                .clicked()
+            {
+                self.apply_cellular_automata(ui.ctx(), false);
+            }
+        });
     }
 
     fn show_bottom_panel(&mut self, ui: &mut Ui) {
@@ -546,11 +931,15 @@ impl VCEMApp {
                 return;
             }
 
-            let Some((texture_id, image_size, highlight_texture_id)) =
+            let Some((texture_id, image_size, cellular_texture_id, highlight_texture_id)) =
                 self.displayed_image.as_ref().map(|displayed| {
                     (
                         displayed.texture.id(),
                         displayed.size,
+                        displayed
+                            .cellular_automata_texture
+                            .as_ref()
+                            .map(|texture| texture.id()),
                         displayed
                             .highlight_texture
                             .as_ref()
@@ -615,15 +1004,14 @@ impl VCEMApp {
                 (self.image_selection_start, response.interact_pointer_pos())
             {
                 let selection_rect = Rect::from_two_pos(start, pointer).intersect(image_rect);
-                if response.dragged_by(PointerButton::Primary)
-                    || response.drag_stopped_by(PointerButton::Primary)
+                if (response.dragged_by(PointerButton::Primary)
+                    || response.drag_stopped_by(PointerButton::Primary))
+                    && let Some(displayed) = self.displayed_image.as_ref()
                 {
-                    if let Some(displayed) = self.displayed_image.as_ref() {
-                        let bins = displayed.bins_in_pointer_rect(image_rect, selection_rect);
-                        if !bins.is_empty() {
-                            self.select_histogram_bins(bins);
-                            ui.ctx().request_repaint();
-                        }
+                    let bins = displayed.bins_in_pointer_rect(image_rect, selection_rect);
+                    if !bins.is_empty() {
+                        self.select_histogram_bins(bins);
+                        ui.ctx().request_repaint();
                     }
                 }
                 Some(selection_rect)
@@ -662,6 +1050,15 @@ impl VCEMApp {
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                 Color32::WHITE,
             );
+
+            if let Some(cellular_texture_id) = cellular_texture_id {
+                painter.image(
+                    cellular_texture_id,
+                    image_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
 
             if let Some(highlight_texture_id) = highlight_texture_id {
                 painter.image(
@@ -1048,7 +1445,15 @@ impl VCEMApp {
             self.applied_denoise = None;
             self.invert_values = false;
             self.applied_invert = false;
+            self.equalization_strength = 0.0;
+            self.applied_equalization = None;
             self.applied_gamma = None;
+            self.rotation = ImageRotation::None;
+            self.applied_rotation = ImageRotation::None;
+            self.cellular_automata_settings = CellularAutomataSettings::default();
+            self.applied_cellular_automata = None;
+            self.cellular_kernel_preset = CellularKernelPreset::Disk;
+            self.cellular_kernel_angle = 0.0;
             self.processing_job = None;
         }
     }
@@ -1066,19 +1471,15 @@ impl VCEMApp {
             return;
         };
 
-        if self.applied_denoise.is_some()
+        if self.applied_rotation != ImageRotation::None
+            || self.applied_denoise.is_some()
             || self.applied_invert
             || self.applied_equalization.is_some()
             || self.applied_gamma.is_some()
         {
-            match processed_image_from_path(
-                &path,
-                self.applied_denoise,
-                self.applied_invert,
-                self.applied_equalization,
-                self.applied_gamma,
-                self.histogram_bin_count,
-            ) {
+            let mut configuration = self.applied_experiment_configuration();
+            configuration.cellular_automata = None;
+            match processed_image_from_path(&path, &configuration) {
                 Ok(processed) => {
                     self.histogram = Some(processed.histogram);
                     self.reset_histogram_view = true;
@@ -1109,13 +1510,30 @@ impl VCEMApp {
         })
     }
 
+    fn applied_experiment_configuration(&self) -> ExperimentConfiguration {
+        ExperimentConfiguration {
+            schema_version: 1,
+            histogram_bin_count: self.histogram_bin_count,
+            rotation: self.applied_rotation,
+            denoise: self.applied_denoise,
+            invert: self.applied_invert,
+            equalization: self.applied_equalization,
+            gamma: self.applied_gamma,
+            cellular_automata: self.applied_cellular_automata.clone(),
+        }
+    }
+
     fn has_image_augmentation_state(&self) -> bool {
         self.applied_denoise.is_some()
+            || self.applied_rotation != ImageRotation::None
+            || self.rotation != ImageRotation::None
             || self.applied_invert
             || self.invert_values
             || self.applied_equalization.is_some()
             || self.equalization_strength != 0.0
             || self.applied_gamma.is_some()
+            || self.applied_cellular_automata.is_some()
+            || self.cellular_automata_settings != CellularAutomataSettings::default()
             || self.denoise_method != DenoiseMethod::None
             || self.denoise_kernel_size != 3
             || self.gamma_value != 1.0
@@ -1134,19 +1552,14 @@ impl VCEMApp {
             return;
         };
 
-        let denoise = self.current_denoise_settings();
+        let mut parameters = self.applied_experiment_configuration();
+        parameters.denoise = self.current_denoise_settings();
         self.start_processing_job(
             ctx,
             image_index,
             path,
             name,
-            ProcessingKind::Denoise {
-                denoise,
-                invert: self.applied_invert,
-                equalization: self.applied_equalization,
-                gamma: self.applied_gamma,
-                bin_count: self.histogram_bin_count,
-            },
+            ProcessingKind::Denoise(parameters),
         );
     }
 
@@ -1163,18 +1576,14 @@ impl VCEMApp {
             return;
         };
 
+        let mut parameters = self.applied_experiment_configuration();
+        parameters.invert = self.invert_values;
         self.start_processing_job(
             ctx,
             image_index,
             path,
             name,
-            ProcessingKind::Invert {
-                denoise: self.applied_denoise,
-                invert: self.invert_values,
-                equalization: self.applied_equalization,
-                gamma: self.applied_gamma,
-                bin_count: self.histogram_bin_count,
-            },
+            ProcessingKind::Invert(parameters),
         );
     }
 
@@ -1192,18 +1601,14 @@ impl VCEMApp {
         };
 
         let equalization = (self.equalization_strength > 0.0).then_some(self.equalization_strength);
+        let mut parameters = self.applied_experiment_configuration();
+        parameters.equalization = equalization;
         self.start_processing_job(
             ctx,
             image_index,
             path,
             name,
-            ProcessingKind::Equalize {
-                denoise: self.applied_denoise,
-                invert: self.applied_invert,
-                equalization,
-                gamma: self.applied_gamma,
-                bin_count: self.histogram_bin_count,
-            },
+            ProcessingKind::Equalize(parameters),
         );
     }
 
@@ -1220,19 +1625,173 @@ impl VCEMApp {
             return;
         };
 
+        let mut parameters = self.applied_experiment_configuration();
+        parameters.gamma = Some(self.gamma_value);
         self.start_processing_job(
             ctx,
             image_index,
             path,
             name,
-            ProcessingKind::Gamma {
-                denoise: self.applied_denoise,
-                invert: self.applied_invert,
-                equalization: self.applied_equalization,
-                gamma: self.gamma_value,
-                bin_count: self.histogram_bin_count,
-            },
+            ProcessingKind::Gamma(parameters),
         );
+    }
+
+    fn apply_cellular_automata(&mut self, ctx: &egui::Context, enabled: bool) {
+        self.viewer_error = None;
+        self.histogram_error = None;
+
+        let Some((image_index, path, name)) = self.selected_image.and_then(|index| {
+            self.images
+                .get(index)
+                .map(|image| (index, image.path.clone(), image.name.clone()))
+        }) else {
+            self.histogram_error =
+                Some("Select an image before applying the feature filter.".to_owned());
+            return;
+        };
+
+        let cellular_automata = enabled.then(|| self.cellular_automata_settings.clone());
+        let mut parameters = self.applied_experiment_configuration();
+        parameters.cellular_automata = cellular_automata;
+        self.start_processing_job(
+            ctx,
+            image_index,
+            path,
+            name,
+            ProcessingKind::CellularAutomata(parameters),
+        );
+    }
+
+    fn apply_rotation(&mut self, ctx: &egui::Context) {
+        self.viewer_error = None;
+        self.histogram_error = None;
+
+        let Some((image_index, path, name)) = self.selected_image.and_then(|index| {
+            self.images
+                .get(index)
+                .map(|image| (index, image.path.clone(), image.name.clone()))
+        }) else {
+            self.histogram_error = Some("Select an image before applying rotation.".to_owned());
+            return;
+        };
+
+        let mut parameters = self.applied_experiment_configuration();
+        parameters.rotation = self.rotation;
+        self.start_processing_job(
+            ctx,
+            image_index,
+            path,
+            name,
+            ProcessingKind::Rotation(parameters),
+        );
+    }
+
+    fn save_applied_configuration(&mut self) {
+        self.configuration_notice = None;
+        self.configuration_error = None;
+        let configuration = self.applied_experiment_configuration();
+        let path = PathBuf::from(self.configuration_path.trim());
+        if path.as_os_str().is_empty() {
+            self.configuration_error = Some("Enter a configuration path.".to_owned());
+            return;
+        }
+
+        let result = serde_json::to_string_pretty(&configuration)
+            .map(|json| format!("{json}\n"))
+            .map_err(|error| format!("Could not encode configuration: {error}"))
+            .and_then(|json| {
+                fs::write(&path, json)
+                    .map_err(|error| format!("Could not save {}: {error}", path.display()))
+            });
+
+        match result {
+            Ok(()) => {
+                self.saved_configuration = Some(configuration);
+                self.configuration_notice = Some(format!("Saved {}", path.display()));
+            }
+            Err(error) => self.configuration_error = Some(error),
+        }
+    }
+
+    fn load_configuration(&mut self) {
+        self.configuration_notice = None;
+        self.configuration_error = None;
+        let path = PathBuf::from(self.configuration_path.trim());
+        if path.as_os_str().is_empty() {
+            self.configuration_error = Some("Enter a configuration path.".to_owned());
+            return;
+        }
+
+        let configuration = fs::read_to_string(&path)
+            .map_err(|error| format!("Could not read {}: {error}", path.display()))
+            .and_then(|json| {
+                serde_json::from_str::<ExperimentConfiguration>(&json)
+                    .map_err(|error| format!("Could not decode {}: {error}", path.display()))
+            })
+            .and_then(|configuration| {
+                validate_experiment_configuration(&configuration)?;
+                Ok(configuration)
+            });
+
+        match configuration {
+            Ok(configuration) => {
+                self.sync_controls_from_configuration(&configuration);
+                self.saved_configuration = Some(configuration);
+                self.configuration_notice = Some(format!("Loaded {}", path.display()));
+            }
+            Err(error) => self.configuration_error = Some(error),
+        }
+    }
+
+    fn apply_saved_configuration(&mut self, ctx: &egui::Context) {
+        self.viewer_error = None;
+        self.histogram_error = None;
+        self.configuration_error = None;
+
+        let Some(configuration) = self.saved_configuration.clone() else {
+            self.configuration_error = Some("Load or save a configuration first.".to_owned());
+            return;
+        };
+        let Some((image_index, path, name)) = self.selected_image.and_then(|index| {
+            self.images
+                .get(index)
+                .map(|image| (index, image.path.clone(), image.name.clone()))
+        }) else {
+            self.configuration_error =
+                Some("Select an image before applying a configuration.".to_owned());
+            return;
+        };
+
+        self.sync_controls_from_configuration(&configuration);
+        let parameters = configuration;
+        self.start_processing_job(
+            ctx,
+            image_index,
+            path,
+            name,
+            ProcessingKind::Configuration(parameters),
+        );
+    }
+
+    fn sync_controls_from_configuration(&mut self, configuration: &ExperimentConfiguration) {
+        self.histogram_bin_count = configuration.histogram_bin_count;
+        self.reset_cellular_response_view = true;
+        self.rotation = configuration.rotation;
+        self.denoise_method = configuration
+            .denoise
+            .map(|settings| settings.method)
+            .unwrap_or(DenoiseMethod::None);
+        self.denoise_kernel_size = configuration
+            .denoise
+            .map(|settings| settings.kernel_size)
+            .unwrap_or(3);
+        self.invert_values = configuration.invert;
+        self.equalization_strength = configuration.equalization.unwrap_or(0.0);
+        self.gamma_value = configuration.gamma.unwrap_or(1.0);
+        self.cellular_automata_settings =
+            configuration.cellular_automata.clone().unwrap_or_default();
+        self.cellular_kernel_preset = CellularKernelPreset::Custom;
+        self.cellular_kernel_angle = 0.0;
     }
 
     fn reset_image_augmentations(&mut self, ctx: &egui::Context) {
@@ -1240,6 +1799,7 @@ impl VCEMApp {
         self.histogram = None;
         self.histogram_error = None;
         self.reset_histogram_view = true;
+        self.reset_cellular_response_view = true;
         self.clear_histogram_highlight();
         self.displayed_image = None;
         self.viewer_needs_fit = true;
@@ -1249,6 +1809,12 @@ impl VCEMApp {
         self.equalization_strength = 0.0;
         self.applied_equalization = None;
         self.applied_gamma = None;
+        self.rotation = ImageRotation::None;
+        self.applied_rotation = ImageRotation::None;
+        self.cellular_automata_settings = CellularAutomataSettings::default();
+        self.applied_cellular_automata = None;
+        self.cellular_kernel_preset = CellularKernelPreset::Disk;
+        self.cellular_kernel_angle = 0.0;
         self.denoise_method = DenoiseMethod::None;
         self.denoise_kernel_size = 3;
         self.gamma_value = 1.0;
@@ -1272,80 +1838,10 @@ impl VCEMApp {
         self.next_processing_job_id += 1;
         let (sender, receiver) = mpsc::channel();
         let repaint_ctx = ctx.clone();
+        let job_kind = kind.clone();
 
         thread::spawn(move || {
-            let result = match kind {
-                ProcessingKind::Preview {
-                    denoise,
-                    invert,
-                    equalization,
-                    gamma,
-                    bin_count,
-                } => processed_image_from_path(
-                    &path,
-                    denoise,
-                    invert,
-                    equalization,
-                    gamma,
-                    bin_count,
-                ),
-                ProcessingKind::Denoise {
-                    denoise,
-                    invert,
-                    equalization,
-                    gamma,
-                    bin_count,
-                } => processed_image_from_path(
-                    &path,
-                    denoise,
-                    invert,
-                    equalization,
-                    gamma,
-                    bin_count,
-                ),
-                ProcessingKind::Invert {
-                    denoise,
-                    invert,
-                    equalization,
-                    gamma,
-                    bin_count,
-                } => processed_image_from_path(
-                    &path,
-                    denoise,
-                    invert,
-                    equalization,
-                    gamma,
-                    bin_count,
-                ),
-                ProcessingKind::Equalize {
-                    denoise,
-                    invert,
-                    equalization,
-                    gamma,
-                    bin_count,
-                } => processed_image_from_path(
-                    &path,
-                    denoise,
-                    invert,
-                    equalization,
-                    gamma,
-                    bin_count,
-                ),
-                ProcessingKind::Gamma {
-                    denoise,
-                    invert,
-                    equalization,
-                    gamma,
-                    bin_count,
-                } => processed_image_from_path(
-                    &path,
-                    denoise,
-                    invert,
-                    equalization,
-                    Some(gamma),
-                    bin_count,
-                ),
-            };
+            let result = processed_image_from_path(&path, kind.parameters());
             let _ = sender.send(ProcessingResult {
                 id,
                 image_index,
@@ -1360,7 +1856,7 @@ impl VCEMApp {
             id,
             image_index,
             receiver,
-            kind,
+            kind: job_kind,
         });
     }
 
@@ -1393,6 +1889,15 @@ impl VCEMApp {
                 let histogram = processed.histogram;
                 let bin_indices = processed.bin_indices;
                 let bin_count = processed.bin_count;
+                let cellular_automata_summary = processed.cellular_automata_summary;
+                let cellular_automata_texture =
+                    processed.cellular_automata_overlay.map(|overlay| {
+                        ctx.load_texture(
+                            format!("{texture_name} cellular feature overlay"),
+                            overlay,
+                            TextureOptions::LINEAR,
+                        )
+                    });
                 let texture =
                     ctx.load_texture(texture_name, processed.color_image, TextureOptions::LINEAR);
                 let should_fit = self.displayed_image.is_none();
@@ -1404,6 +1909,8 @@ impl VCEMApp {
                     bin_count,
                     highlight_bins: Vec::new(),
                     highlight_texture: None,
+                    cellular_automata_texture,
+                    cellular_automata_summary,
                 });
                 if self
                     .selected_histogram_bins
@@ -1428,10 +1935,19 @@ impl VCEMApp {
 
     fn show_histogram_zoom_controls(&mut self, ui: &mut Ui, _histogram: &IntensityHistogram) {
         ui.horizontal(|ui| {
-            if ui.button("Reset").clicked() {
+            if ui
+                .button("Reset")
+                .on_hover_text("Restores the histogram plot bounds.")
+                .clicked()
+            {
                 self.reset_histogram_view = true;
             }
-            if !self.selected_histogram_bins.is_empty() && ui.button("Clear Selection").clicked() {
+            if !self.selected_histogram_bins.is_empty()
+                && ui
+                    .button("Clear Selection")
+                    .on_hover_text("Clears selected intensity bins and image overlays.")
+                    .clicked()
+            {
                 self.clear_histogram_highlight();
             }
         });
@@ -1520,13 +2036,7 @@ impl VCEMApp {
                 .flatten();
             let drag_stopped = plot_ui.response().drag_stopped_by(PointerButton::Primary);
 
-            if plot_ui.response().contains_pointer() {
-                let scroll_delta = plot_ui.ctx().input(|input| input.smooth_scroll_delta.y);
-                if scroll_delta != 0.0 {
-                    let zoom_factor = (scroll_delta * 0.002).exp();
-                    plot_ui.zoom_bounds_around_hovered(Vec2::splat(zoom_factor));
-                }
-            }
+            zoom_hovered_plot_with_scroll(plot_ui);
 
             (clicked_bin, drag_start_bin, drag_current_bin, drag_stopped)
         });
@@ -1583,13 +2093,7 @@ impl VCEMApp {
             image_index,
             path,
             name,
-            ProcessingKind::Preview {
-                denoise: self.applied_denoise,
-                invert: self.applied_invert,
-                equalization: self.applied_equalization,
-                gamma: self.applied_gamma,
-                bin_count: self.histogram_bin_count,
-            },
+            ProcessingKind::Preview(self.applied_experiment_configuration()),
         );
     }
 
@@ -1616,58 +2120,387 @@ impl ImagePickerEntryKind {
 }
 
 impl ProcessingKind {
-    fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
-            Self::Preview { .. } => "preview",
-            Self::Denoise { .. } => "denoising",
-            Self::Invert { .. } => "inversion",
-            Self::Equalize { .. } => "equalization",
-            Self::Gamma { .. } => "gamma adjustment",
+            Self::Preview(_) => "preview",
+            Self::Rotation(_) => "rotation",
+            Self::Denoise(_) => "denoising",
+            Self::Invert(_) => "inversion",
+            Self::Equalize(_) => "equalization",
+            Self::Gamma(_) => "gamma adjustment",
+            Self::CellularAutomata(_) => "cellular feature filter",
+            Self::Configuration(_) => "saved configuration",
         }
     }
 
-    fn texture_name(self, image_name: &str) -> String {
+    fn texture_name(&self, image_name: &str) -> String {
         match self {
-            Self::Preview { .. } => format!("{image_name} preview"),
-            Self::Denoise { denoise, .. } => {
-                let stage_name = denoise
+            Self::Preview(_) => format!("{image_name} preview"),
+            Self::Rotation(parameters) => {
+                format!("{image_name} rotated {}", parameters.rotation.degrees())
+            }
+            Self::Denoise(parameters) => {
+                let stage_name = parameters
+                    .denoise
                     .map(|settings| settings.method.label())
                     .unwrap_or("raw");
                 format!("{image_name} {stage_name} denoise")
             }
-            Self::Invert { invert, .. } => {
-                let stage_name = if invert { "inverted" } else { "uninverted" };
+            Self::Invert(parameters) => {
+                let stage_name = if parameters.invert {
+                    "inverted"
+                } else {
+                    "uninverted"
+                };
                 format!("{image_name} {stage_name} values")
             }
-            Self::Equalize { equalization, .. } => {
-                let stage_name = equalization
+            Self::Equalize(parameters) => {
+                let stage_name = parameters
+                    .equalization
                     .map(|strength| format!("equalized {:.0}%", strength * 100.0))
                     .unwrap_or_else(|| "unequalized".to_owned());
                 format!("{image_name} {stage_name}")
             }
-            Self::Gamma { gamma, .. } => format!("{image_name} gamma {gamma:.3}"),
+            Self::Gamma(parameters) => {
+                format!("{image_name} gamma {:.3}", parameters.gamma.unwrap_or(1.0))
+            }
+            Self::CellularAutomata(parameters) => {
+                let stage_name = if parameters.cellular_automata.is_some() {
+                    "cellular feature filter"
+                } else {
+                    "without cellular feature filter"
+                };
+                format!("{image_name} {stage_name}")
+            }
+            Self::Configuration(_) => format!("{image_name} saved configuration"),
+        }
+    }
+
+    fn parameters(&self) -> &ExperimentConfiguration {
+        match self {
+            Self::Preview(parameters)
+            | Self::Rotation(parameters)
+            | Self::Denoise(parameters)
+            | Self::Invert(parameters)
+            | Self::Equalize(parameters)
+            | Self::Gamma(parameters)
+            | Self::CellularAutomata(parameters)
+            | Self::Configuration(parameters) => parameters,
         }
     }
 
     fn apply_to(self, app: &mut VCEMApp) {
         match self {
-            Self::Preview { .. } => {}
-            Self::Denoise { denoise, .. } => {
-                app.applied_denoise = denoise;
+            Self::Preview(_) => {}
+            Self::Rotation(parameters) => {
+                app.applied_rotation = parameters.rotation;
+                app.rotation = parameters.rotation;
+                app.viewer_needs_fit = true;
             }
-            Self::Invert { invert, .. } => {
-                app.applied_invert = invert;
-                app.invert_values = invert;
+            Self::Denoise(parameters) => {
+                app.applied_denoise = parameters.denoise;
             }
-            Self::Equalize { equalization, .. } => {
-                app.applied_equalization = equalization;
-                app.equalization_strength = equalization.unwrap_or(0.0);
+            Self::Invert(parameters) => {
+                app.applied_invert = parameters.invert;
+                app.invert_values = parameters.invert;
             }
-            Self::Gamma { gamma, .. } => {
-                app.applied_gamma = Some(gamma);
+            Self::Equalize(parameters) => {
+                app.applied_equalization = parameters.equalization;
+                app.equalization_strength = parameters.equalization.unwrap_or(0.0);
+            }
+            Self::Gamma(parameters) => {
+                app.applied_gamma = parameters.gamma;
+            }
+            Self::CellularAutomata(parameters) => {
+                app.applied_cellular_automata = parameters.cellular_automata;
+            }
+            Self::Configuration(parameters) => {
+                parameters.apply_as_current(app);
+                app.configuration_notice = Some("Applied saved configuration".to_owned());
+                app.viewer_needs_fit = true;
             }
         }
     }
+}
+
+impl ExperimentConfiguration {
+    fn apply_as_current(self, app: &mut VCEMApp) {
+        app.histogram_bin_count = self.histogram_bin_count;
+        app.applied_rotation = self.rotation;
+        app.rotation = self.rotation;
+        app.applied_denoise = self.denoise;
+        app.denoise_method = self
+            .denoise
+            .map(|settings| settings.method)
+            .unwrap_or(DenoiseMethod::None);
+        app.denoise_kernel_size = self
+            .denoise
+            .map(|settings| settings.kernel_size)
+            .unwrap_or(3);
+        app.applied_invert = self.invert;
+        app.invert_values = self.invert;
+        app.applied_equalization = self.equalization;
+        app.equalization_strength = self.equalization.unwrap_or(0.0);
+        app.applied_gamma = self.gamma;
+        app.gamma_value = self.gamma.unwrap_or(1.0);
+        app.applied_cellular_automata = self.cellular_automata.clone();
+        app.cellular_automata_settings = self.cellular_automata.unwrap_or_default();
+        app.cellular_kernel_preset = CellularKernelPreset::Custom;
+        app.cellular_kernel_angle = 0.0;
+    }
+}
+
+impl CellularAutomataSeedMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bright => "Bright features",
+            Self::Dark => "Dark features",
+        }
+    }
+}
+
+impl CellularAutomataResponse {
+    const ALL: [Self; 4] = [
+        Self::Gaussian,
+        Self::Band,
+        Self::Threshold,
+        Self::LowThreshold,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Gaussian => "Gaussian target",
+            Self::Band => "Survival band",
+            Self::Threshold => "High-pass threshold",
+            Self::LowThreshold => "Low-pass threshold",
+        }
+    }
+}
+
+impl ImageRotation {
+    const ALL: [Self; 4] = [
+        Self::None,
+        Self::Clockwise90,
+        Self::HalfTurn,
+        Self::Clockwise270,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "0",
+            Self::Clockwise90 => "90",
+            Self::HalfTurn => "180",
+            Self::Clockwise270 => "270",
+        }
+    }
+}
+
+impl CellularKernelPreset {
+    const ALL: [Self; 6] = [
+        Self::Disk,
+        Self::Ring,
+        Self::Line,
+        Self::Cross,
+        Self::Crescent,
+        Self::Clear,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Custom => "Custom",
+            Self::Disk => "Disk",
+            Self::Ring => "Ring",
+            Self::Line => "Line",
+            Self::Cross => "Cross",
+            Self::Crescent => "Crescent",
+            Self::Clear => "Clear",
+        }
+    }
+}
+
+fn resize_cellular_kernel(settings: &mut CellularAutomataSettings, new_size: usize) {
+    let new_size = new_size.clamp(3, 15) | 1;
+    let old_size = settings.kernel_size;
+    let old_kernel = std::mem::take(&mut settings.kernel);
+    let mut new_kernel = vec![0.0; new_size * new_size];
+    let copy_size = old_size.min(new_size);
+    let old_start = (old_size - copy_size) / 2;
+    let new_start = (new_size - copy_size) / 2;
+
+    for y in 0..copy_size {
+        for x in 0..copy_size {
+            new_kernel[(new_start + y) * new_size + new_start + x] =
+                old_kernel[(old_start + y) * old_size + old_start + x];
+        }
+    }
+
+    settings.kernel_size = new_size;
+    settings.kernel = new_kernel;
+}
+
+fn apply_cellular_kernel_preset(
+    settings: &mut CellularAutomataSettings,
+    preset: CellularKernelPreset,
+    angle_degrees: f32,
+) {
+    if preset == CellularKernelPreset::Custom {
+        return;
+    }
+
+    let size = settings.kernel_size;
+    let center = (size / 2) as f32;
+    let radius = center.max(1.0);
+    let angle = angle_degrees.to_radians();
+    let direction = Vec2::new(angle.cos(), angle.sin());
+    let normal = Vec2::new(-direction.y, direction.x);
+
+    for y in 0..size {
+        for x in 0..size {
+            let point = Vec2::new(x as f32 - center, y as f32 - center);
+            let distance = point.length();
+            let along = point.dot(direction);
+            let across = point.dot(normal);
+            let active = match preset {
+                CellularKernelPreset::Custom => false,
+                CellularKernelPreset::Disk => distance <= radius,
+                CellularKernelPreset::Ring => {
+                    distance <= radius && distance >= (radius - 1.25).max(radius * 0.55)
+                }
+                CellularKernelPreset::Line => along.abs() <= radius && across.abs() <= 0.65,
+                CellularKernelPreset::Cross => point.x.abs() <= 0.65 || point.y.abs() <= 0.65,
+                CellularKernelPreset::Crescent => {
+                    let notch_center = direction * (radius * 0.45);
+                    distance <= radius && (point - notch_center).length() >= radius * 0.78
+                }
+                CellularKernelPreset::Clear => false,
+            };
+            settings.kernel[y * size + x] = if active { 1.0 } else { 0.0 };
+        }
+    }
+}
+
+fn next_kernel_weight(weight: f32, reverse: bool) -> f32 {
+    if reverse {
+        if weight > 0.0 {
+            0.0
+        } else if weight < 0.0 {
+            1.0
+        } else {
+            -1.0
+        }
+    } else if weight > 0.0 {
+        -1.0
+    } else if weight < 0.0 {
+        0.0
+    } else {
+        1.0
+    }
+}
+
+fn cellular_response_preview(sensed: f32, settings: &CellularAutomataSettings) -> f32 {
+    let center = settings.response_center.clamp(-1.0, 1.0);
+    let width = settings.response_width.clamp(0.001, 2.0);
+
+    match settings.response {
+        CellularAutomataResponse::Gaussian => {
+            let distance = (sensed - center) / width;
+            2.0 * (-0.5 * distance * distance).exp() - 1.0
+        }
+        CellularAutomataResponse::Band => {
+            let edge_distance = width - (sensed - center).abs();
+            (edge_distance / (width * 0.15).max(0.005)).tanh()
+        }
+        CellularAutomataResponse::Threshold => ((sensed - center) / width.max(0.005)).tanh(),
+        CellularAutomataResponse::LowThreshold => ((center - sensed) / width.max(0.005)).tanh(),
+    }
+}
+
+fn zoom_hovered_plot_with_scroll(plot_ui: &mut PlotUi<'_>) {
+    if !plot_ui.response().contains_pointer() {
+        return;
+    }
+
+    let scroll_delta = plot_ui.ctx().input(|input| input.smooth_scroll_delta);
+    if scroll_delta == Vec2::ZERO {
+        return;
+    }
+
+    if scroll_delta.y != 0.0 {
+        let zoom_factor = (scroll_delta.y * 0.002).exp();
+        plot_ui.zoom_bounds_around_hovered(Vec2::splat(zoom_factor));
+    }
+    plot_ui
+        .ctx()
+        .input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
+}
+
+fn validate_experiment_configuration(
+    configuration: &ExperimentConfiguration,
+) -> std::result::Result<(), String> {
+    if configuration.schema_version != 1 {
+        return Err(format!(
+            "Unsupported configuration schema version {}.",
+            configuration.schema_version
+        ));
+    }
+    if !(2..=4096).contains(&configuration.histogram_bin_count) {
+        return Err("Histogram bin count must be between 2 and 4096.".to_owned());
+    }
+    if let Some(denoise) = configuration.denoise
+        && !matches!(denoise.kernel_size, 3 | 5 | 7)
+    {
+        return Err("Denoising kernel size must be 3, 5, or 7.".to_owned());
+    }
+    if configuration
+        .equalization
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err("Equalization strength must be between 0 and 1.".to_owned());
+    }
+    if configuration
+        .gamma
+        .is_some_and(|value| !value.is_finite() || !(0.001..=4.0).contains(&value))
+    {
+        return Err("Gamma must be between 0.001 and 4.".to_owned());
+    }
+
+    if let Some(settings) = &configuration.cellular_automata {
+        if !(3..=15).contains(&settings.kernel_size)
+            || settings.kernel_size.is_multiple_of(2)
+            || settings.kernel.len() != settings.kernel_size * settings.kernel_size
+        {
+            return Err("Cellular kernel must be an odd square from 3 x 3 to 15 x 15.".to_owned());
+        }
+        if settings.kernel.iter().any(|weight| !weight.is_finite())
+            || !settings
+                .kernel
+                .iter()
+                .any(|weight| weight.abs() > f32::EPSILON)
+        {
+            return Err("Cellular kernel must contain finite, non-zero weights.".to_owned());
+        }
+        let scalar_values = [
+            settings.response_center,
+            settings.response_width,
+            settings.growth_rate,
+            settings.decay_rate,
+            settings.time_step,
+        ];
+        if scalar_values.iter().any(|value| !value.is_finite()) {
+            return Err("Cellular response and evolution values must be finite.".to_owned());
+        }
+        if !(-1.0..=1.0).contains(&settings.response_center)
+            || !(0.01..=1.0).contains(&settings.response_width)
+            || !(0.0..=2.0).contains(&settings.growth_rate)
+            || !(0.0..=2.0).contains(&settings.decay_rate)
+            || !(0.01..=0.5).contains(&settings.time_step)
+            || !(1..=128).contains(&settings.iterations)
+        {
+            return Err("Cellular settings fall outside the supported UI ranges.".to_owned());
+        }
+    }
+
+    Ok(())
 }
 
 impl DisplayedImage {
