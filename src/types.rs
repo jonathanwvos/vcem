@@ -10,12 +10,35 @@ pub struct DisplayedImage {
     pub image_index: usize,
     pub size: Vec2,
     pub texture: TextureHandle,
+    pub bin_indices: Vec<usize>,
+    pub bin_count: usize,
+    pub highlight_bins: Vec<usize>,
+    pub highlight_texture: Option<TextureHandle>,
 }
 
 pub struct ProcessedImage {
     pub size: Vec2,
     pub color_image: ColorImage,
     pub histogram: IntensityHistogram,
+    pub bin_indices: Vec<usize>,
+    pub bin_count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DenoiseMethod {
+    None,
+    Median,
+    Gaussian,
+    NonLocalMeans,
+}
+
+#[derive(Clone, Copy)]
+pub struct DenoiseSettings {
+    pub method: DenoiseMethod,
+    pub kernel_size: usize,
+    pub strength: f64,
+    pub template_window: usize,
+    pub search_window: usize,
 }
 
 #[derive(Clone)]

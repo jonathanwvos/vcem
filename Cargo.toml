@@ -9,3 +9,4 @@ image = "0.25.10"
 opencv = "0.100.1"
 egui_extras = { version = "0.35", features = ["all_loaders"] }
 egui_plot = "0.36"
+tiff = "0.11.3"
