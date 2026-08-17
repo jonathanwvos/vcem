@@ -728,7 +728,7 @@ impl VCEMApp {
                                         kernel_weight_button(weight).sense(Sense::click_and_drag()),
                                     )
                                     .on_hover_text(
-                                        "Click toggles the selected brush. Drag paints with it. Right click cycles in reverse.",
+                                        "Click toggles the selected sign. Drag toggles from the starting cell and paints or erases with it. Right click cycles in reverse.",
                                     );
 
                                 if response.clicked_by(PointerButton::Primary) {
@@ -742,10 +742,13 @@ impl VCEMApp {
                                 }
 
                                 if response.drag_started_by(PointerButton::Primary) {
-                                    self.cellular_kernel_drag_brush =
-                                        Some(self.cellular_kernel_brush);
+                                    let drag_brush = toggled_kernel_brush(
+                                        weight,
+                                        self.cellular_kernel_brush,
+                                    );
+                                    self.cellular_kernel_drag_brush = Some(drag_brush);
                                     self.cellular_automata_settings.kernel[index] =
-                                        self.cellular_kernel_brush.weight();
+                                        drag_brush.weight();
                                     self.cellular_kernel_preset = CellularKernelPreset::Custom;
                                 }
 
@@ -2484,16 +2487,19 @@ fn kernel_weight_fill(weight: f32) -> Option<Color32> {
 }
 
 fn toggle_kernel_weight(weight: f32, brush: CellularKernelBrush) -> f32 {
-    let brush_weight = brush.weight();
-    if kernel_weights_match(weight, brush_weight) {
-        0.0
+    toggled_kernel_brush(weight, brush).weight()
+}
+
+fn toggled_kernel_brush(weight: f32, brush: CellularKernelBrush) -> CellularKernelBrush {
+    if kernel_weights_match(weight, brush.weight()) {
+        CellularKernelBrush::Empty
     } else {
-        brush_weight
+        brush
     }
 }
 
 fn kernel_weights_match(left: f32, right: f32) -> bool {
-    left.signum() == right.signum()
+    (left > 0.0 && right > 0.0) || (left < 0.0 && right < 0.0) || (left == 0.0 && right == 0.0)
 }
 
 fn next_kernel_weight(weight: f32, reverse: bool) -> f32 {
@@ -2719,5 +2725,50 @@ impl App for VCEMApp {
         self.show_bottom_panel(ui);
         self.show_central_panel(ui);
         self.show_image_picker_modal(ui.ctx());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CellularKernelBrush, toggle_kernel_weight, toggled_kernel_brush};
+
+    #[test]
+    fn selected_kernel_sign_toggles_off_and_back_on() {
+        for brush in [CellularKernelBrush::Positive, CellularKernelBrush::Negative] {
+            let selected_weight = brush.weight();
+            let toggled_off = toggle_kernel_weight(selected_weight, brush);
+            let toggled_back_on = toggle_kernel_weight(toggled_off, brush);
+
+            assert_eq!(toggled_off, 0.0);
+            assert_eq!(toggled_back_on, selected_weight);
+        }
+    }
+
+    #[test]
+    fn drag_uses_toggle_decided_by_its_starting_cell() {
+        assert!(matches!(
+            toggled_kernel_brush(1.0, CellularKernelBrush::Positive),
+            CellularKernelBrush::Empty
+        ));
+        assert!(matches!(
+            toggled_kernel_brush(0.0, CellularKernelBrush::Positive),
+            CellularKernelBrush::Positive
+        ));
+        assert!(matches!(
+            toggled_kernel_brush(-1.0, CellularKernelBrush::Positive),
+            CellularKernelBrush::Positive
+        ));
+        assert!(matches!(
+            toggled_kernel_brush(-1.0, CellularKernelBrush::Negative),
+            CellularKernelBrush::Empty
+        ));
+        assert!(matches!(
+            toggled_kernel_brush(0.0, CellularKernelBrush::Negative),
+            CellularKernelBrush::Negative
+        ));
+        assert!(matches!(
+            toggled_kernel_brush(1.0, CellularKernelBrush::Negative),
+            CellularKernelBrush::Negative
+        ));
     }
 }
