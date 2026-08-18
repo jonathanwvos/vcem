@@ -77,7 +77,7 @@ impl HistogramStateInitializer {
         }
     }
 
-    pub fn compile(&self) -> Result<CompiledHistogramStateInitializer, String> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.version != HISTOGRAM_INITIALIZER_VERSION {
             return Err(format!(
                 "Unsupported histogram state initializer version {}.",
@@ -92,7 +92,7 @@ impl HistogramStateInitializer {
             return Err("Discrete state initialization requires at least two states.".to_owned());
         }
 
-        let bin_to_state = match &self.bin_to_state {
+        match &self.bin_to_state {
             None => {
                 if self.state_count != self.bin_count {
                     return Err(
@@ -100,7 +100,6 @@ impl HistogramStateInitializer {
                             .to_owned(),
                     );
                 }
-                None
             }
             Some(mapping) => {
                 let expected_len = usize::try_from(self.bin_count).map_err(|_| {
@@ -123,14 +122,25 @@ impl HistogramStateInitializer {
                         self.state_count
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn compile(&self) -> Result<CompiledHistogramStateInitializer, String> {
+        self.validate()?;
+        let bin_to_state = self
+            .bin_to_state
+            .as_ref()
+            .map(|mapping| -> Result<Arc<Vec<u32>>, String> {
                 let mut compiled_mapping = Vec::new();
                 compiled_mapping
                     .try_reserve_exact(mapping.len())
                     .map_err(|_| "Could not allocate histogram bin-to-state mapping.".to_owned())?;
                 compiled_mapping.extend_from_slice(mapping);
-                Some(Arc::new(compiled_mapping))
-            }
-        };
+                Ok(Arc::new(compiled_mapping))
+            })
+            .transpose()?;
 
         Ok(CompiledHistogramStateInitializer {
             calibration: self.calibration,

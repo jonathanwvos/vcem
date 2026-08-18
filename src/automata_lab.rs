@@ -1,25 +1,41 @@
-use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, fmt, mem::size_of, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    mem::size_of,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crate::{
+    automata::{
+        AUTOMATA_PROGRAM_SCHEMA_VERSION, AutomataCompileLimits, AutomataFrameworkError,
+        AutomataModelDefinition, AutomataProgramDocument, AutomataRunInput,
+        AutomataSimulationResult, CompiledAutomataProgram, ContinuousLeniaProgramDefinition,
+        compile_automata_program, run_compiled_automata_with_cancellation,
+    },
     continuous_automata::{
-        CONTINUOUS_INITIALIZER_VERSION, CONTINUOUS_LENIA_PROGRAM_VERSION, CompiledContinuousLenia,
-        ContinuousAutomataError, ContinuousBoundaryPolicy, ContinuousCompileLimits,
+        CONTINUOUS_INITIALIZER_VERSION, CONTINUOUS_LENIA_PROGRAM_VERSION,
+        CONTINUOUS_RUN_CONFIG_VERSION, ContinuousAutomataError, ContinuousBoundaryPolicy,
         ContinuousDiagnostics, ContinuousDomain, ContinuousGrowthFunction, ContinuousLeniaProgram,
         ContinuousRunConfig, ContinuousStateInitializer, DenseContinuousKernel,
-        KernelNormalization, compile_continuous_lenia, run_continuous_lenia,
+        KernelNormalization,
+    },
+    discrete_automata::{
+        CompactState, DISCRETE_RUN_CONFIG_VERSION, DiscreteAutomataError, DiscreteDiagnostics,
+        DiscreteRunConfig,
     },
     quantization::IntensityCalibration,
 };
 
-pub const AUTOMATA_LAB_SETTINGS_VERSION: u32 = 1;
-
 const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Editable Lenia controls. This is an authoring adapter rather than a second
+/// persisted program format: the Lab compiles the resulting shared program
+/// document and retains that document as the session identity.
+#[derive(Clone, Debug, PartialEq)]
 pub struct LeniaLabSettings {
-    pub version: u32,
     pub kernel_size: u32,
     pub kernel_ring_center: f32,
     pub kernel_ring_width: f32,
@@ -27,15 +43,11 @@ pub struct LeniaLabSettings {
     pub growth_width: f32,
     pub time_step: f32,
     pub boundary: ContinuousBoundaryPolicy,
-    pub checkpoint_interval: u32,
-    pub max_state_bytes: u64,
-    pub max_history_bytes: u64,
 }
 
 impl Default for LeniaLabSettings {
     fn default() -> Self {
         Self {
-            version: AUTOMATA_LAB_SETTINGS_VERSION,
             kernel_size: 5,
             kernel_ring_center: 0.55,
             kernel_ring_width: 0.18,
@@ -43,20 +55,12 @@ impl Default for LeniaLabSettings {
             growth_width: 0.08,
             time_step: 0.1,
             boundary: ContinuousBoundaryPolicy::Wrap,
-            checkpoint_interval: 1,
-            max_state_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
-            max_history_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
         }
     }
 }
 
 impl LeniaLabSettings {
     pub fn validate(&self) -> Result<(), AutomataLabError> {
-        if self.version != AUTOMATA_LAB_SETTINGS_VERSION {
-            return Err(AutomataLabError::UnsupportedSettingsVersion {
-                found: self.version,
-            });
-        }
         if self.kernel_size == 0 || self.kernel_size > 31 || self.kernel_size.is_multiple_of(2) {
             return Err(AutomataLabError::InvalidSettings(
                 "Lenia Lab kernel_size must be odd and between 1 and 31.".to_owned(),
@@ -83,79 +87,179 @@ impl LeniaLabSettings {
                     .to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    pub fn program_document(
+        &self,
+        calibration: IntensityCalibration,
+    ) -> Result<AutomataProgramDocument, AutomataLabError> {
+        self.validate()?;
+        Ok(AutomataProgramDocument {
+            schema_version: AUTOMATA_PROGRAM_SCHEMA_VERSION,
+            transition_model: AutomataModelDefinition::ContinuousLenia(
+                ContinuousLeniaProgramDefinition {
+                    initializer: ContinuousStateInitializer {
+                        version: CONTINUOUS_INITIALIZER_VERSION,
+                        calibration,
+                        domain: ContinuousDomain::UNIT,
+                    },
+                    program: ContinuousLeniaProgram {
+                        version: CONTINUOUS_LENIA_PROGRAM_VERSION,
+                        domain: ContinuousDomain::UNIT,
+                        kernel: radial_ring_kernel(self)?,
+                        kernel_normalization: KernelNormalization::SumToOne,
+                        boundary: self.boundary,
+                        growth: ContinuousGrowthFunction::canonical_gaussian(
+                            self.growth_center,
+                            self.growth_width,
+                        ),
+                        time_step: self.time_step,
+                    },
+                },
+            ),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LabExecutionPolicy {
+    pub max_working_memory_bytes: u64,
+    pub exact_discrete_cycle_detection: bool,
+    pub max_diagnostic_memory_bytes: u64,
+    pub continuous_convergence_tolerance: f32,
+}
+
+impl Default for LabExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            max_working_memory_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+            exact_discrete_cycle_detection: false,
+            max_diagnostic_memory_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+            continuous_convergence_tolerance: 1.0e-6,
+        }
+    }
+}
+
+impl LabExecutionPolicy {
+    fn validate(self) -> Result<(), AutomataLabError> {
+        if !self.continuous_convergence_tolerance.is_finite()
+            || self.continuous_convergence_tolerance < 0.0
+        {
+            return Err(AutomataLabError::InvalidExecutionPolicy);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabCapturePolicy {
+    pub checkpoint_interval: u32,
+    pub max_history_bytes: u64,
+}
+
+impl Default for LabCapturePolicy {
+    fn default() -> Self {
+        Self {
+            checkpoint_interval: 1,
+            max_history_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+        }
+    }
+}
+
+impl LabCapturePolicy {
+    fn validate(self) -> Result<(), AutomataLabError> {
         if self.checkpoint_interval == 0 {
-            return Err(AutomataLabError::InvalidSettings(
+            return Err(AutomataLabError::InvalidCapturePolicy(
                 "Checkpoint interval must be at least one generation.".to_owned(),
             ));
         }
         Ok(())
     }
+}
 
-    fn compile_program(&self) -> Result<CompiledContinuousLenia, AutomataLabError> {
-        self.validate()?;
-        let kernel = radial_ring_kernel(self)?;
-        compile_continuous_lenia(
-            ContinuousLeniaProgram {
-                version: CONTINUOUS_LENIA_PROGRAM_VERSION,
-                domain: ContinuousDomain::UNIT,
-                kernel,
-                kernel_normalization: KernelNormalization::SumToOne,
-                boundary: self.boundary,
-                growth: ContinuousGrowthFunction::canonical_gaussian(
-                    self.growth_center,
-                    self.growth_width,
-                ),
-                time_step: self.time_step,
-            },
-            ContinuousCompileLimits::default(),
-        )
-        .map_err(AutomataLabError::Continuous)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LabDiagnostics {
+    Discrete(DiscreteDiagnostics),
+    Continuous(ContinuousDiagnostics),
+}
+
+#[derive(Clone, Debug)]
+enum LabState {
+    Discrete(Arc<CompactState>),
+    Continuous(Arc<Vec<f32>>),
+}
+
+impl LabState {
+    fn byte_len(&self) -> Result<u64, AutomataLabError> {
+        let bytes = match self {
+            Self::Discrete(state) => state.byte_len().ok_or(AutomataLabError::SizeOverflow)?,
+            Self::Continuous(state) => state
+                .len()
+                .checked_mul(size_of::<f32>())
+                .ok_or(AutomataLabError::SizeOverflow)?,
+        };
+        u64::try_from(bytes).map_err(|_| AutomataLabError::SizeOverflow)
+    }
+
+    fn identity(&self) -> (u8, usize) {
+        match self {
+            Self::Discrete(state) => (0, Arc::as_ptr(state) as usize),
+            Self::Continuous(state) => (1, Arc::as_ptr(state) as usize),
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct LabCheckpoint {
     pub generation: u32,
-    pub diagnostics: Option<ContinuousDiagnostics>,
-    state: Arc<Vec<f32>>,
+    pub diagnostics: Option<LabDiagnostics>,
+    state: LabState,
 }
 
 #[derive(Clone, Debug)]
-pub struct LabCandidateSnapshot {
+pub struct LabStateBookmark {
     pub name: String,
     pub generation: u32,
-    pub diagnostics: Option<ContinuousDiagnostics>,
-    state: Arc<Vec<f32>>,
+    pub diagnostics: Option<LabDiagnostics>,
+    state: LabState,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LabStepOutcome {
-    pub checkpoint_created: bool,
-    pub checkpoint_skipped_for_budget: bool,
+    pub checkpoints_created: u32,
+    pub checkpoints_skipped_for_budget: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct AutomataLabSession {
     size: [usize; 2],
     calibration: IntensityCalibration,
-    settings: LeniaLabSettings,
-    program: CompiledContinuousLenia,
-    initial_state: Arc<Vec<f32>>,
-    current_state: Arc<Vec<f32>>,
+    program_document: AutomataProgramDocument,
+    program: CompiledAutomataProgram,
+    execution_policy: LabExecutionPolicy,
+    capture_policy: LabCapturePolicy,
+    initial_state: LabState,
+    current_state: LabState,
     generation: u32,
-    last_diagnostics: Option<ContinuousDiagnostics>,
+    last_diagnostics: Option<LabDiagnostics>,
     checkpoints: Vec<LabCheckpoint>,
-    candidates: Vec<LabCandidateSnapshot>,
+    bookmarks: Vec<LabStateBookmark>,
 }
 
 impl AutomataLabSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         prepared_values: &[u32],
         calibration: IntensityCalibration,
         size: [usize; 2],
-        settings: LeniaLabSettings,
+        program_document: AutomataProgramDocument,
+        compile_limits: AutomataCompileLimits,
+        execution_policy: LabExecutionPolicy,
+        capture_policy: LabCapturePolicy,
     ) -> Result<Self, AutomataLabError> {
-        settings.validate()?;
+        execution_policy.validate()?;
+        capture_policy.validate()?;
         let cell_count = size[0]
             .checked_mul(size[1])
             .filter(|count| *count > 0)
@@ -166,42 +270,57 @@ impl AutomataLabSession {
                 actual: prepared_values.len(),
             });
         }
-        let initializer = ContinuousStateInitializer {
-            version: CONTINUOUS_INITIALIZER_VERSION,
-            calibration,
-            domain: ContinuousDomain::UNIT,
-        }
-        .compile()
-        .map_err(AutomataLabError::Continuous)?;
-        let initial_state = Arc::new(
-            initializer
-                .initialize(prepared_values, settings.max_state_bytes)
-                .map_err(AutomataLabError::Continuous)?,
-        );
-        let state_bytes = state_bytes(initial_state.len())?;
-        if state_bytes > settings.max_history_bytes {
+
+        let program = compile_automata_program(program_document.clone(), compile_limits)
+            .map_err(AutomataLabError::Framework)?;
+        let initial_state = match &program {
+            CompiledAutomataProgram::DiscreteMapV1(program) => LabState::Discrete(Arc::new(
+                program
+                    .compact_initial_state_from_intensities(
+                        calibration,
+                        prepared_values,
+                        execution_policy.max_working_memory_bytes,
+                    )
+                    .map_err(AutomataLabError::Framework)?,
+            )),
+            CompiledAutomataProgram::ContinuousLeniaV1(program) => LabState::Continuous(Arc::new(
+                program
+                    .initial_state_from_intensities(
+                        calibration,
+                        prepared_values,
+                        execution_policy.max_working_memory_bytes,
+                    )
+                    .map_err(AutomataLabError::Framework)?,
+            )),
+            CompiledAutomataProgram::LegacyEvidenceGrowthV1(_) => {
+                return Err(AutomataLabError::LegacyModelNotSupported);
+            }
+        };
+        let state_bytes = initial_state.byte_len()?;
+        if state_bytes > capture_policy.max_history_bytes {
             return Err(AutomataLabError::HistoryBudgetExceeded {
                 required_bytes: state_bytes,
-                budget_bytes: settings.max_history_bytes,
+                budget_bytes: capture_policy.max_history_bytes,
             });
         }
-        let program = settings.compile_program()?;
         let checkpoints = vec![LabCheckpoint {
             generation: 0,
             diagnostics: None,
-            state: Arc::clone(&initial_state),
+            state: initial_state.clone(),
         }];
         Ok(Self {
             size,
             calibration,
-            settings,
+            program_document,
             program,
-            initial_state: Arc::clone(&initial_state),
+            execution_policy,
+            capture_policy,
+            initial_state: initial_state.clone(),
             current_state: initial_state,
             generation: 0,
             last_diagnostics: None,
             checkpoints,
-            candidates: Vec::new(),
+            bookmarks: Vec::new(),
         })
     }
 
@@ -213,19 +332,49 @@ impl AutomataLabSession {
         self.calibration
     }
 
-    pub fn settings(&self) -> &LeniaLabSettings {
-        &self.settings
+    pub fn program_document(&self) -> &AutomataProgramDocument {
+        &self.program_document
+    }
+
+    pub fn capture_policy(&self) -> LabCapturePolicy {
+        self.capture_policy
+    }
+
+    pub fn set_capture_policy(
+        &mut self,
+        capture_policy: LabCapturePolicy,
+    ) -> Result<(), AutomataLabError> {
+        capture_policy.validate()?;
+        let retained = self.retained_history_bytes();
+        if retained > capture_policy.max_history_bytes {
+            return Err(AutomataLabError::HistoryBudgetExceeded {
+                required_bytes: retained,
+                budget_bytes: capture_policy.max_history_bytes,
+            });
+        }
+        self.capture_policy = capture_policy;
+        Ok(())
     }
 
     pub fn generation(&self) -> u32 {
         self.generation
     }
 
-    pub fn current_state(&self) -> &[f32] {
-        self.current_state.as_slice()
+    pub fn continuous_state(&self) -> Option<&[f32]> {
+        match &self.current_state {
+            LabState::Continuous(state) => Some(state.as_slice()),
+            LabState::Discrete(_) => None,
+        }
     }
 
-    pub fn last_diagnostics(&self) -> Option<ContinuousDiagnostics> {
+    pub fn discrete_state(&self) -> Option<&CompactState> {
+        match &self.current_state {
+            LabState::Discrete(state) => Some(state.as_ref()),
+            LabState::Continuous(_) => None,
+        }
+    }
+
+    pub fn last_diagnostics(&self) -> Option<LabDiagnostics> {
         self.last_diagnostics
     }
 
@@ -233,82 +382,163 @@ impl AutomataLabSession {
         &self.checkpoints
     }
 
-    pub fn candidates(&self) -> &[LabCandidateSnapshot] {
-        &self.candidates
+    pub fn bookmarks(&self) -> &[LabStateBookmark] {
+        &self.bookmarks
     }
 
     pub fn retained_history_bytes(&self) -> u64 {
         retained_state_bytes(
             &self.initial_state,
             self.checkpoints.iter().map(|checkpoint| &checkpoint.state),
-            self.candidates.iter().map(|candidate| &candidate.state),
+            self.bookmarks.iter().map(|bookmark| &bookmark.state),
         )
     }
 
     pub fn step(&mut self, cycles: u32) -> Result<LabStepOutcome, AutomataLabError> {
+        self.step_with_cancellation(cycles, &AtomicBool::new(false))
+    }
+
+    pub fn step_with_cancellation(
+        &mut self,
+        cycles: u32,
+        cancellation: &AtomicBool,
+    ) -> Result<LabStepOutcome, AutomataLabError> {
         if cycles == 0 {
             return Err(AutomataLabError::InvalidStepCycles);
         }
-        let next_generation = self
+        let final_generation = self
             .generation
             .checked_add(cycles)
             .ok_or(AutomataLabError::GenerationOverflow)?;
-        let result = run_continuous_lenia(
-            &self.program,
-            self.current_state.as_slice(),
-            self.size[0],
-            self.size[1],
-            &ContinuousRunConfig {
-                max_working_memory_bytes: self.settings.max_state_bytes,
-                ..ContinuousRunConfig::new(cycles)
-            },
-        )
-        .map_err(AutomataLabError::Continuous)?;
-        let previous_generation = self.generation;
-        let mut diagnostics = result.diagnostics;
-        diagnostics.exact_fixed_point_generation = diagnostics
-            .exact_fixed_point_generation
-            .map(|generation| {
-                previous_generation
-                    .checked_add(generation)
-                    .ok_or(AutomataLabError::GenerationOverflow)
-            })
-            .transpose()?;
-        self.current_state = Arc::new(result.final_state);
-        self.generation = next_generation;
-        self.last_diagnostics = Some(diagnostics);
 
-        let crossed_checkpoint = previous_generation / self.settings.checkpoint_interval
-            != self.generation / self.settings.checkpoint_interval;
-        let mut outcome = LabStepOutcome {
-            checkpoint_created: false,
-            checkpoint_skipped_for_budget: false,
-        };
-        if crossed_checkpoint {
-            self.checkpoints.push(LabCheckpoint {
-                generation: self.generation,
-                diagnostics: self.last_diagnostics,
-                state: Arc::clone(&self.current_state),
-            });
-            if self.retained_history_bytes() > self.settings.max_history_bytes {
-                self.checkpoints.pop();
-                outcome.checkpoint_skipped_for_budget = true;
-            } else {
-                outcome.checkpoint_created = true;
+        let mut generation = self.generation;
+        let mut current_state = self.current_state.clone();
+        let mut diagnostics = self.last_diagnostics;
+        let mut checkpoints = self.checkpoints.clone();
+        let mut outcome = LabStepOutcome::default();
+
+        while generation < final_generation {
+            if cancellation.load(Ordering::Relaxed) {
+                return Err(AutomataLabError::Cancelled);
+            }
+            let interval = self.capture_policy.checkpoint_interval;
+            let until_checkpoint = interval - generation % interval;
+            let chunk_cycles = until_checkpoint.min(final_generation - generation);
+            let chunk_start = generation;
+            let (next_state, mut chunk_diagnostics) =
+                self.run_chunk(&current_state, chunk_cycles, cancellation)?;
+            offset_diagnostics(&mut chunk_diagnostics, chunk_start)?;
+            generation = generation
+                .checked_add(chunk_cycles)
+                .ok_or(AutomataLabError::GenerationOverflow)?;
+            current_state = next_state;
+            diagnostics = Some(chunk_diagnostics);
+
+            if generation.is_multiple_of(interval) {
+                checkpoints.push(LabCheckpoint {
+                    generation,
+                    diagnostics,
+                    state: current_state.clone(),
+                });
+                let required = retained_state_bytes(
+                    &self.initial_state,
+                    checkpoints.iter().map(|checkpoint| &checkpoint.state),
+                    self.bookmarks.iter().map(|bookmark| &bookmark.state),
+                );
+                if required > self.capture_policy.max_history_bytes {
+                    checkpoints.pop();
+                    outcome.checkpoints_skipped_for_budget += 1;
+                } else {
+                    outcome.checkpoints_created += 1;
+                }
             }
         }
+
+        self.current_state = current_state;
+        self.generation = generation;
+        self.last_diagnostics = diagnostics;
+        self.checkpoints = checkpoints;
         Ok(outcome)
     }
 
+    fn run_chunk(
+        &self,
+        current_state: &LabState,
+        cycles: u32,
+        cancellation: &AtomicBool,
+    ) -> Result<(LabState, LabDiagnostics), AutomataLabError> {
+        let result = match (&self.program, current_state) {
+            (CompiledAutomataProgram::DiscreteMapV1(_), LabState::Discrete(state)) => {
+                let config = DiscreteRunConfig {
+                    version: DISCRETE_RUN_CONFIG_VERSION,
+                    cycles,
+                    max_working_memory_bytes: self.execution_policy.max_working_memory_bytes,
+                    exact_cycle_detection: self.execution_policy.exact_discrete_cycle_detection,
+                    max_diagnostic_memory_bytes: self.execution_policy.max_diagnostic_memory_bytes,
+                };
+                run_compiled_automata_with_cancellation(
+                    &self.program,
+                    AutomataRunInput::DiscreteState {
+                        state,
+                        config: &config,
+                    },
+                    self.size[0],
+                    self.size[1],
+                    cancellation,
+                )
+            }
+            (CompiledAutomataProgram::ContinuousLeniaV1(_), LabState::Continuous(state)) => {
+                let config = ContinuousRunConfig {
+                    version: CONTINUOUS_RUN_CONFIG_VERSION,
+                    cycles,
+                    max_working_memory_bytes: self.execution_policy.max_working_memory_bytes,
+                    convergence_tolerance: self.execution_policy.continuous_convergence_tolerance,
+                };
+                run_compiled_automata_with_cancellation(
+                    &self.program,
+                    AutomataRunInput::ContinuousState {
+                        state,
+                        config: &config,
+                    },
+                    self.size[0],
+                    self.size[1],
+                    cancellation,
+                )
+            }
+            _ => return Err(AutomataLabError::StateModelMismatch),
+        }
+        .map_err(|error| match error {
+            AutomataFrameworkError::Continuous(ContinuousAutomataError::Cancelled)
+            | AutomataFrameworkError::Discrete(DiscreteAutomataError::Cancelled) => {
+                AutomataLabError::Cancelled
+            }
+            error => AutomataLabError::Framework(error),
+        })?;
+
+        match result {
+            AutomataSimulationResult::DiscreteMapV1(result) => Ok((
+                LabState::Discrete(Arc::new(result.final_state)),
+                LabDiagnostics::Discrete(result.diagnostics),
+            )),
+            AutomataSimulationResult::ContinuousLeniaV1(result) => Ok((
+                LabState::Continuous(Arc::new(result.final_state)),
+                LabDiagnostics::Continuous(result.diagnostics),
+            )),
+            AutomataSimulationResult::LegacyEvidenceGrowthV1(_) => {
+                Err(AutomataLabError::StateModelMismatch)
+            }
+        }
+    }
+
     pub fn reset(&mut self) {
-        self.current_state = Arc::clone(&self.initial_state);
+        self.current_state = self.initial_state.clone();
         self.generation = 0;
         self.last_diagnostics = None;
         self.checkpoints.clear();
         self.checkpoints.push(LabCheckpoint {
             generation: 0,
             diagnostics: None,
-            state: Arc::clone(&self.initial_state),
+            state: self.initial_state.clone(),
         });
     }
 
@@ -325,62 +555,57 @@ impl AutomataLabSession {
         Ok(())
     }
 
-    pub fn save_candidate(&mut self, name: &str) -> Result<(), AutomataLabError> {
+    pub fn save_bookmark(&mut self, name: &str) -> Result<(), AutomataLabError> {
         let name = name.trim();
         if name.is_empty() {
-            return Err(AutomataLabError::EmptyCandidateName);
+            return Err(AutomataLabError::EmptyBookmarkName);
         }
-        if self
-            .candidates
-            .iter()
-            .any(|candidate| candidate.name == name)
-        {
-            return Err(AutomataLabError::DuplicateCandidateName {
+        if self.bookmarks.iter().any(|bookmark| bookmark.name == name) {
+            return Err(AutomataLabError::DuplicateBookmarkName {
                 name: name.to_owned(),
             });
         }
-        self.candidates.push(LabCandidateSnapshot {
+        self.bookmarks.push(LabStateBookmark {
             name: name.to_owned(),
             generation: self.generation,
             diagnostics: self.last_diagnostics,
-            state: Arc::clone(&self.current_state),
+            state: self.current_state.clone(),
         });
         let required_bytes = self.retained_history_bytes();
-        if required_bytes > self.settings.max_history_bytes {
-            self.candidates.pop();
+        if required_bytes > self.capture_policy.max_history_bytes {
+            self.bookmarks.pop();
             return Err(AutomataLabError::HistoryBudgetExceeded {
                 required_bytes,
-                budget_bytes: self.settings.max_history_bytes,
+                budget_bytes: self.capture_policy.max_history_bytes,
             });
         }
         Ok(())
     }
 
-    pub fn restore_candidate(&mut self, index: usize) -> Result<(), AutomataLabError> {
-        let candidate = self
-            .candidates
+    pub fn restore_bookmark(&mut self, index: usize) -> Result<(), AutomataLabError> {
+        let bookmark = self
+            .bookmarks
             .get(index)
-            .ok_or(AutomataLabError::CandidateNotFound { index })?
+            .ok_or(AutomataLabError::BookmarkNotFound { index })?
             .clone();
-        self.current_state = Arc::clone(&candidate.state);
-        self.generation = candidate.generation;
-        self.last_diagnostics = candidate.diagnostics;
+        self.current_state = bookmark.state.clone();
+        self.generation = bookmark.generation;
+        self.last_diagnostics = bookmark.diagnostics;
         self.checkpoints.clear();
         self.checkpoints.push(LabCheckpoint {
-            generation: candidate.generation,
-            diagnostics: candidate.diagnostics,
-            state: candidate.state,
+            generation: bookmark.generation,
+            diagnostics: bookmark.diagnostics,
+            state: bookmark.state,
         });
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum AutomataLabError {
-    UnsupportedSettingsVersion {
-        found: u32,
-    },
     InvalidSettings(String),
+    InvalidExecutionPolicy,
+    InvalidCapturePolicy(String),
     InvalidDimensions {
         size: [usize; 2],
     },
@@ -393,11 +618,11 @@ pub enum AutomataLabError {
     CheckpointNotFound {
         index: usize,
     },
-    CandidateNotFound {
+    BookmarkNotFound {
         index: usize,
     },
-    EmptyCandidateName,
-    DuplicateCandidateName {
+    EmptyBookmarkName,
+    DuplicateBookmarkName {
         name: String,
     },
     HistoryBudgetExceeded {
@@ -405,19 +630,20 @@ pub enum AutomataLabError {
         budget_bytes: u64,
     },
     SizeOverflow,
-    Continuous(ContinuousAutomataError),
+    LegacyModelNotSupported,
+    StateModelMismatch,
+    Cancelled,
+    Framework(AutomataFrameworkError),
 }
 
 impl fmt::Display for AutomataLabError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedSettingsVersion { found } => {
-                write!(
-                    formatter,
-                    "Unsupported Automata Lab settings version {found}."
-                )
+            Self::InvalidSettings(error) | Self::InvalidCapturePolicy(error) => {
+                formatter.write_str(error)
             }
-            Self::InvalidSettings(error) => formatter.write_str(error),
+            Self::InvalidExecutionPolicy => formatter
+                .write_str("Continuous convergence tolerance must be finite and non-negative."),
             Self::InvalidDimensions { size } => write!(
                 formatter,
                 "Automata Lab requires non-zero addressable dimensions; found {} x {}.",
@@ -436,14 +662,17 @@ impl fmt::Display for AutomataLabError {
             Self::CheckpointNotFound { index } => {
                 write!(formatter, "Automata Lab checkpoint {index} does not exist.")
             }
-            Self::CandidateNotFound { index } => {
-                write!(formatter, "Automata Lab candidate {index} does not exist.")
+            Self::BookmarkNotFound { index } => {
+                write!(
+                    formatter,
+                    "Automata Lab state bookmark {index} does not exist."
+                )
             }
-            Self::EmptyCandidateName => {
-                formatter.write_str("Candidate snapshots require a non-empty name.")
+            Self::EmptyBookmarkName => {
+                formatter.write_str("State bookmarks require a non-empty name.")
             }
-            Self::DuplicateCandidateName { name } => {
-                write!(formatter, "A candidate named {name:?} already exists.")
+            Self::DuplicateBookmarkName { name } => {
+                write!(formatter, "A state bookmark named {name:?} already exists.")
             }
             Self::HistoryBudgetExceeded {
                 required_bytes,
@@ -453,17 +682,46 @@ impl fmt::Display for AutomataLabError {
                 "Automata Lab history requires {required_bytes} bytes, exceeding the {budget_bytes}-byte budget."
             ),
             Self::SizeOverflow => formatter.write_str("Automata Lab state size overflowed."),
-            Self::Continuous(error) => error.fmt(formatter),
+            Self::LegacyModelNotSupported => formatter.write_str(
+                "The autonomous Automata Lab does not run the legacy evidence-gated model.",
+            ),
+            Self::StateModelMismatch => {
+                formatter.write_str("Automata Lab state does not match its compiled model.")
+            }
+            Self::Cancelled => formatter.write_str("Automata Lab computation was cancelled."),
+            Self::Framework(error) => error.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for AutomataLabError {}
 
-impl From<ContinuousAutomataError> for AutomataLabError {
-    fn from(error: ContinuousAutomataError) -> Self {
-        Self::Continuous(error)
+fn offset_diagnostics(
+    diagnostics: &mut LabDiagnostics,
+    generation_offset: u32,
+) -> Result<(), AutomataLabError> {
+    let offset = |generation: u32| {
+        generation_offset
+            .checked_add(generation)
+            .ok_or(AutomataLabError::GenerationOverflow)
+    };
+    match diagnostics {
+        LabDiagnostics::Continuous(diagnostics) => {
+            diagnostics.exact_fixed_point_generation = diagnostics
+                .exact_fixed_point_generation
+                .map(offset)
+                .transpose()?;
+        }
+        LabDiagnostics::Discrete(diagnostics) => {
+            diagnostics.fixed_point_generation =
+                diagnostics.fixed_point_generation.map(offset).transpose()?;
+            if let Some(cycle) = &mut diagnostics.cycle {
+                cycle.start_generation = offset(cycle.start_generation)?;
+                cycle.first_repeat_generation = offset(cycle.first_repeat_generation)?;
+            }
+        }
     }
+    Ok(())
 }
 
 fn radial_ring_kernel(
@@ -498,28 +756,19 @@ fn radial_ring_kernel(
     })
 }
 
-fn state_bytes(len: usize) -> Result<u64, AutomataLabError> {
-    len.checked_mul(size_of::<f32>())
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(AutomataLabError::SizeOverflow)
-}
-
 fn retained_state_bytes<'a>(
-    initial_state: &'a Arc<Vec<f32>>,
-    checkpoints: impl Iterator<Item = &'a Arc<Vec<f32>>>,
-    candidates: impl Iterator<Item = &'a Arc<Vec<f32>>>,
+    initial_state: &'a LabState,
+    checkpoints: impl Iterator<Item = &'a LabState>,
+    bookmarks: impl Iterator<Item = &'a LabState>,
 ) -> u64 {
-    let mut pointers = BTreeSet::new();
+    let mut identities = BTreeSet::new();
     let mut bytes = 0_u64;
     for state in std::iter::once(initial_state)
         .chain(checkpoints)
-        .chain(candidates)
+        .chain(bookmarks)
     {
-        let pointer = Arc::as_ptr(state) as usize;
-        if pointers.insert(pointer) {
-            bytes = bytes.saturating_add(
-                u64::try_from(state.len().saturating_mul(size_of::<f32>())).unwrap_or(u64::MAX),
-            );
+        if identities.insert(state.identity()) {
+            bytes = bytes.saturating_add(state.byte_len().unwrap_or(u64::MAX));
         }
     }
     bytes
@@ -528,140 +777,199 @@ fn retained_state_bytes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        automata::{AutomataModelDefinition, DiscreteMapProgram},
+        discrete_automata::{
+            BoundaryPolicy, CompactState, DISCRETE_PROGRAM_VERSION, DiscreteProgram, DiscreteRule,
+            StateStorage,
+        },
+        quantization::{HISTOGRAM_INITIALIZER_VERSION, HistogramStateInitializer},
+    };
 
-    fn session(settings: LeniaLabSettings) -> AutomataLabSession {
+    fn continuous_session(
+        capture_policy: LabCapturePolicy,
+    ) -> Result<AutomataLabSession, AutomataLabError> {
+        let calibration = IntensityCalibration::full_scale(256).unwrap();
         AutomataLabSession::new(
             &[0, 64, 128, 255],
-            IntensityCalibration::full_scale(256).unwrap(),
+            calibration,
             [2, 2],
-            settings,
+            LeniaLabSettings::default()
+                .program_document(calibration)
+                .unwrap(),
+            AutomataCompileLimits::default(),
+            LabExecutionPolicy::default(),
+            capture_policy,
         )
-        .unwrap()
+    }
+
+    fn discrete_identity_document(calibration: IntensityCalibration) -> AutomataProgramDocument {
+        AutomataProgramDocument {
+            schema_version: AUTOMATA_PROGRAM_SCHEMA_VERSION,
+            transition_model: AutomataModelDefinition::DiscreteMap(DiscreteMapProgram {
+                initializer: HistogramStateInitializer {
+                    version: HISTOGRAM_INITIALIZER_VERSION,
+                    calibration,
+                    bin_count: 2,
+                    state_count: 2,
+                    bin_to_state: None,
+                },
+                program: DiscreteProgram {
+                    version: DISCRETE_PROGRAM_VERSION,
+                    state_count: 2,
+                    storage: StateStorage::U8,
+                    kernel: Vec::new(),
+                    boundary: BoundaryPolicy::Wrap,
+                    rule: DiscreteRule::Direct {
+                        table: CompactState::U8(vec![0, 1]),
+                    },
+                },
+            }),
+        }
     }
 
     #[test]
-    fn generation_zero_is_calibrated_and_reset_is_exact() {
-        let mut session = session(LeniaLabSettings::default());
-        let initial = session.current_state().to_vec();
+    fn lenia_authoring_controls_compile_into_the_shared_program_document() {
+        let calibration = IntensityCalibration::full_scale(256).unwrap();
+        let document = LeniaLabSettings::default()
+            .program_document(calibration)
+            .unwrap();
+        assert!(matches!(
+            document.transition_model,
+            AutomataModelDefinition::ContinuousLenia(_)
+        ));
+        compile_automata_program(document, AutomataCompileLimits::default()).unwrap();
+    }
+
+    #[test]
+    fn continuous_generation_zero_is_calibrated_and_reset_is_exact() {
+        let mut session = continuous_session(LabCapturePolicy::default()).unwrap();
+        let initial = session.continuous_state().unwrap().to_vec();
         assert_eq!(initial[0], 0.0);
         assert_eq!(initial[3], 1.0);
-        assert_eq!(session.checkpoints().len(), 1);
-
         session.step(2).unwrap();
-        assert_eq!(session.generation(), 2);
         session.reset();
-
         assert_eq!(session.generation(), 0);
-        assert_eq!(session.current_state(), initial);
-        assert_eq!(session.checkpoints().len(), 1);
-        assert_eq!(session.checkpoints()[0].generation, 0);
+        assert_eq!(session.continuous_state().unwrap(), initial);
     }
 
     #[test]
-    fn diagnostics_use_the_session_generation_across_separate_steps() {
+    fn discrete_programs_use_the_same_lab_session_and_dispatcher() {
+        let calibration = IntensityCalibration::full_scale(256).unwrap();
         let mut session = AutomataLabSession::new(
-            &[0],
-            IntensityCalibration::full_scale(256).unwrap(),
-            [1, 1],
-            LeniaLabSettings::default(),
+            &[0, 255],
+            calibration,
+            [2, 1],
+            discrete_identity_document(calibration),
+            AutomataCompileLimits::default(),
+            LabExecutionPolicy::default(),
+            LabCapturePolicy::default(),
         )
         .unwrap();
-
-        session.step(1).unwrap();
+        session.step(3).unwrap();
+        assert_eq!(session.generation(), 3);
         assert_eq!(
-            session
-                .last_diagnostics()
-                .unwrap()
-                .exact_fixed_point_generation,
-            Some(0)
+            session.discrete_state().unwrap(),
+            &CompactState::U8(vec![0, 1])
         );
-        session.step(2).unwrap();
-        assert_eq!(
-            session
-                .last_diagnostics()
-                .unwrap()
-                .exact_fixed_point_generation,
-            Some(1)
-        );
+        assert!(matches!(
+            session.last_diagnostics(),
+            Some(LabDiagnostics::Discrete(_))
+        ));
     }
 
     #[test]
-    fn stepping_creates_timeline_checkpoints_and_restore_branches_history() {
-        let settings = LeniaLabSettings {
+    fn multi_cycle_steps_capture_every_exact_interval() {
+        let mut session = continuous_session(LabCapturePolicy {
             checkpoint_interval: 2,
-            ..LeniaLabSettings::default()
-        };
-        let mut session = session(settings);
-
-        assert!(!session.step(1).unwrap().checkpoint_created);
-        assert!(session.step(1).unwrap().checkpoint_created);
-        assert!(session.step(2).unwrap().checkpoint_created);
+            ..LabCapturePolicy::default()
+        })
+        .unwrap();
+        let outcome = session.step(7).unwrap();
+        assert_eq!(outcome.checkpoints_created, 3);
         assert_eq!(
             session
                 .checkpoints()
                 .iter()
                 .map(|checkpoint| checkpoint.generation)
                 .collect::<Vec<_>>(),
-            [0, 2, 4]
+            [0, 2, 4, 6]
         );
-
-        session.restore_checkpoint(1).unwrap();
-        assert_eq!(session.generation(), 2);
-        assert_eq!(session.checkpoints().len(), 2);
+        assert_eq!(session.generation(), 7);
     }
 
     #[test]
-    fn named_candidates_share_states_and_can_be_restored() {
-        let mut session = session(LeniaLabSettings::default());
+    fn capture_policy_changes_do_not_reset_or_recompile_the_session() {
+        let mut session = continuous_session(LabCapturePolicy::default()).unwrap();
         session.step(1).unwrap();
-        let candidate_state = session.current_state().to_vec();
-        session.save_candidate("first").unwrap();
-        let retained = session.retained_history_bytes();
-        session.step(1).unwrap();
-        assert!(session.retained_history_bytes() >= retained);
-
-        session.restore_candidate(0).unwrap();
+        let document = session.program_document().clone();
+        session
+            .set_capture_policy(LabCapturePolicy {
+                checkpoint_interval: 5,
+                ..LabCapturePolicy::default()
+            })
+            .unwrap();
         assert_eq!(session.generation(), 1);
-        assert_eq!(session.current_state(), candidate_state);
+        assert_eq!(session.program_document(), &document);
+        assert_eq!(session.capture_policy().checkpoint_interval, 5);
+    }
+
+    #[test]
+    fn cancellation_is_atomic_at_checkpoint_chunk_boundaries() {
+        let mut session = continuous_session(LabCapturePolicy::default()).unwrap();
+        let before = session.continuous_state().unwrap().to_vec();
+        let cancellation = AtomicBool::new(true);
+        assert!(matches!(
+            session.step_with_cancellation(5, &cancellation),
+            Err(AutomataLabError::Cancelled)
+        ));
+        assert_eq!(session.generation(), 0);
+        assert_eq!(session.continuous_state().unwrap(), before);
+    }
+
+    #[test]
+    fn state_bookmarks_share_states_and_restore_without_losing_generation_zero() {
+        let mut session = continuous_session(LabCapturePolicy::default()).unwrap();
+        session.step(1).unwrap();
+        let bookmarked = session.continuous_state().unwrap().to_vec();
+        session.save_bookmark("first").unwrap();
+        session.step(1).unwrap();
+        session.restore_bookmark(0).unwrap();
+        assert_eq!(session.generation(), 1);
+        assert_eq!(session.continuous_state().unwrap(), bookmarked);
         assert_eq!(
             session.retained_history_bytes(),
             2 * 4 * size_of::<f32>() as u64
         );
-        assert!(matches!(
-            session.save_candidate("first"),
-            Err(AutomataLabError::DuplicateCandidateName { .. })
-        ));
     }
 
     #[test]
     fn invalid_settings_and_history_budgets_fail_without_partial_sessions() {
-        let mut settings = LeniaLabSettings {
+        let calibration = IntensityCalibration::full_scale(256).unwrap();
+        let invalid = LeniaLabSettings {
             kernel_size: 4,
             ..LeniaLabSettings::default()
         };
         assert!(matches!(
-            AutomataLabSession::new(
-                &[0],
-                IntensityCalibration::full_scale(256).unwrap(),
-                [1, 1],
-                settings.clone(),
-            ),
+            invalid.program_document(calibration),
             Err(AutomataLabError::InvalidSettings(_))
         ));
-
-        settings.kernel_size = 1;
-        settings.max_history_bytes = 3;
         assert!(matches!(
             AutomataLabSession::new(
                 &[0],
-                IntensityCalibration::full_scale(256).unwrap(),
+                calibration,
                 [1, 1],
-                settings,
+                LeniaLabSettings::default()
+                    .program_document(calibration)
+                    .unwrap(),
+                AutomataCompileLimits::default(),
+                LabExecutionPolicy::default(),
+                LabCapturePolicy {
+                    max_history_bytes: 3,
+                    ..LabCapturePolicy::default()
+                },
             ),
-            Err(AutomataLabError::HistoryBudgetExceeded {
-                required_bytes: 4,
-                budget_bytes: 3,
-            })
+            Err(AutomataLabError::HistoryBudgetExceeded { .. })
         ));
     }
 }

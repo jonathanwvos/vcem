@@ -5,7 +5,10 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     mem::size_of,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 pub const DISCRETE_PROGRAM_VERSION: u32 = 1;
@@ -461,6 +464,7 @@ pub enum DiscreteAutomataError {
         actual: StateStorage,
     },
     InternalStorageMismatch,
+    Cancelled,
 }
 
 impl fmt::Display for DiscreteAutomataError {
@@ -570,6 +574,7 @@ impl fmt::Display for DiscreteAutomataError {
             Self::InternalStorageMismatch => {
                 formatter.write_str("Compiled rule and state storage do not match.")
             }
+            Self::Cancelled => formatter.write_str("Discrete automata run was cancelled."),
         }
     }
 }
@@ -696,6 +701,69 @@ pub fn compile_discrete_program(
     program: DiscreteProgram,
     limits: CompileLimits,
 ) -> Result<CompiledDiscreteAutomaton, DiscreteAutomataError> {
+    // The owned presence list is sorted below, so compilation can detect
+    // duplicate triggers without allocating a second index just for
+    // validation. Borrowed persistence validation still uses an index because
+    // it must not mutate the serialized order.
+    validate_discrete_program_inner(&program, limits, false)?;
+    let expected_storage = program.storage;
+    let state_count = program.state_count;
+    let rule = match program.rule {
+        DiscreteRule::Direct { table } => CompiledRule::Direct {
+            table: SharedTable::from_compact(table),
+        },
+        DiscreteRule::Aggregate { reducer, table } => CompiledRule::Aggregate {
+            reducer,
+            table: SharedTable::from_compact(table),
+        },
+        DiscreteRule::OrderedNeighborhood { table } => CompiledRule::OrderedNeighborhood {
+            table: SharedTable::from_compact(table),
+        },
+        DiscreteRule::PresenceTriggered {
+            mut transitions,
+            reduction,
+            fallback,
+        } => {
+            transitions.sort_unstable_by_key(|transition| transition.trigger_state);
+            if let Some(window) = transitions
+                .windows(2)
+                .find(|window| window[0].trigger_state == window[1].trigger_state)
+            {
+                return Err(DiscreteAutomataError::DuplicatePresenceTrigger {
+                    trigger_state: window[0].trigger_state,
+                });
+            }
+            CompiledRule::PresenceTriggered {
+                transitions: Arc::new(transitions),
+                reduction,
+                fallback: SharedTable::from_compact(fallback),
+            }
+        }
+    };
+
+    Ok(CompiledDiscreteAutomaton {
+        state_count,
+        storage: expected_storage,
+        kernel: Arc::new(program.kernel),
+        boundary: program.boundary,
+        rule,
+    })
+}
+
+/// Validates a serialized discrete program without cloning or consuming its
+/// dense transition table. Persistence code uses this before binding results.
+pub fn validate_discrete_program(
+    program: &DiscreteProgram,
+    limits: CompileLimits,
+) -> Result<(), DiscreteAutomataError> {
+    validate_discrete_program_inner(program, limits, true)
+}
+
+fn validate_discrete_program_inner(
+    program: &DiscreteProgram,
+    limits: CompileLimits,
+    check_presence_duplicates: bool,
+) -> Result<(), DiscreteAutomataError> {
     if program.version != DISCRETE_PROGRAM_VERSION {
         return Err(DiscreteAutomataError::UnsupportedProgramVersion {
             found: program.version,
@@ -746,21 +814,17 @@ pub fn compile_discrete_program(
         }
     }
 
-    let state_count = program.state_count;
     let kernel_len = program.kernel.len();
-    let rule = match program.rule {
+    match &program.rule {
         DiscreteRule::Direct { table } => {
             validate_dense_table(
-                &table,
-                state_count,
+                table,
+                program.state_count,
                 expected_storage,
                 DiscreteRuleKind::Direct,
                 state_count_usize,
                 limits.max_table_bytes,
             )?;
-            CompiledRule::Direct {
-                table: SharedTable::from_compact(table),
-            }
         }
         DiscreteRule::Aggregate { reducer, table } => {
             let expected_len = match reducer {
@@ -773,85 +837,78 @@ pub fn compile_discrete_program(
                     })?,
             };
             validate_dense_table(
-                &table,
-                state_count,
+                table,
+                program.state_count,
                 expected_storage,
                 DiscreteRuleKind::Aggregate,
                 expected_len,
                 limits.max_table_bytes,
             )?;
-            CompiledRule::Aggregate {
-                reducer,
-                table: SharedTable::from_compact(table),
-            }
         }
         DiscreteRule::OrderedNeighborhood { table } => {
             let expected_len =
                 checked_power(state_count_usize, kernel_len, "ordered-neighborhood table")?;
             validate_dense_table(
-                &table,
-                state_count,
+                table,
+                program.state_count,
                 expected_storage,
                 DiscreteRuleKind::OrderedNeighborhood,
                 expected_len,
                 limits.max_table_bytes,
             )?;
-            CompiledRule::OrderedNeighborhood {
-                table: SharedTable::from_compact(table),
-            }
         }
         DiscreteRule::PresenceTriggered {
-            mut transitions,
-            reduction,
+            transitions,
+            reduction: _,
             fallback,
         } => {
             validate_dense_table(
-                &fallback,
-                state_count,
+                fallback,
+                program.state_count,
                 expected_storage,
                 DiscreteRuleKind::PresenceTriggered,
                 state_count_usize,
                 limits.max_table_bytes,
             )?;
-            transitions.sort_unstable_by_key(|transition| transition.trigger_state);
+            let mut triggers = check_presence_duplicates.then(HashMap::new);
+            if let Some(triggers) = &mut triggers {
+                triggers.try_reserve(transitions.len()).map_err(|_| {
+                    DiscreteAutomataError::AllocationFailed {
+                        context: "presence trigger index",
+                        requested_bytes: transitions
+                            .len()
+                            .saturating_mul(size_of::<(u32, usize)>()),
+                    }
+                })?;
+            }
             for (index, transition) in transitions.iter().copied().enumerate() {
-                if transition.trigger_state >= state_count {
+                if transition.trigger_state >= program.state_count {
                     return Err(DiscreteAutomataError::StateValueOutOfRange {
                         context: "presence trigger",
                         index,
                         value: transition.trigger_state,
-                        state_count,
+                        state_count: program.state_count,
                     });
                 }
-                if transition.output_state >= state_count {
+                if transition.output_state >= program.state_count {
                     return Err(DiscreteAutomataError::StateValueOutOfRange {
                         context: "presence output",
                         index,
                         value: transition.output_state,
-                        state_count,
+                        state_count: program.state_count,
                     });
                 }
-                if index > 0 && transitions[index - 1].trigger_state == transition.trigger_state {
+                if triggers.as_mut().is_some_and(|triggers| {
+                    triggers.insert(transition.trigger_state, index).is_some()
+                }) {
                     return Err(DiscreteAutomataError::DuplicatePresenceTrigger {
                         trigger_state: transition.trigger_state,
                     });
                 }
             }
-            CompiledRule::PresenceTriggered {
-                transitions: Arc::new(transitions),
-                reduction,
-                fallback: SharedTable::from_compact(fallback),
-            }
         }
-    };
-
-    Ok(CompiledDiscreteAutomaton {
-        state_count,
-        storage: expected_storage,
-        kernel: Arc::new(program.kernel),
-        boundary: program.boundary,
-        rule,
-    })
+    }
+    Ok(())
 }
 
 fn validate_dense_table(
@@ -1014,6 +1071,35 @@ pub fn run_discrete_automaton(
     height: usize,
     config: &DiscreteRunConfig,
 ) -> Result<DiscreteSimulationResult, DiscreteAutomataError> {
+    run_discrete_automaton_inner(automaton, initial_state, width, height, config, None)
+}
+
+pub fn run_discrete_automaton_with_cancellation(
+    automaton: &CompiledDiscreteAutomaton,
+    initial_state: &CompactState,
+    width: usize,
+    height: usize,
+    config: &DiscreteRunConfig,
+    cancellation: &AtomicBool,
+) -> Result<DiscreteSimulationResult, DiscreteAutomataError> {
+    run_discrete_automaton_inner(
+        automaton,
+        initial_state,
+        width,
+        height,
+        config,
+        Some(cancellation),
+    )
+}
+
+fn run_discrete_automaton_inner(
+    automaton: &CompiledDiscreteAutomaton,
+    initial_state: &CompactState,
+    width: usize,
+    height: usize,
+    config: &DiscreteRunConfig,
+    cancellation: Option<&AtomicBool>,
+) -> Result<DiscreteSimulationResult, DiscreteAutomataError> {
     if config.version != DISCRETE_RUN_CONFIG_VERSION {
         return Err(DiscreteAutomataError::UnsupportedRunConfigVersion {
             found: config.version,
@@ -1091,6 +1177,7 @@ pub fn run_discrete_automaton(
                 width,
                 height,
                 config,
+                cancellation,
             )?;
             (CompactState::U8(state), diagnostics)
         }
@@ -1102,6 +1189,7 @@ pub fn run_discrete_automaton(
                 width,
                 height,
                 config,
+                cancellation,
             )?;
             (CompactState::U16(state), diagnostics)
         }
@@ -1113,6 +1201,7 @@ pub fn run_discrete_automaton(
                 width,
                 height,
                 config,
+                cancellation,
             )?;
             (CompactState::U32(state), diagnostics)
         }
@@ -1136,6 +1225,7 @@ fn run_typed<T: Symbol>(
     width: usize,
     height: usize,
     config: &DiscreteRunConfig,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<(Vec<T>, DiscreteDiagnostics), DiscreteAutomataError> {
     let byte_len =
         initial
@@ -1197,6 +1287,9 @@ fn run_typed<T: Symbol>(
     };
 
     for generation in 1..=config.cycles {
+        if cancellation.is_some_and(|token| token.load(Ordering::Relaxed)) {
+            return Err(DiscreteAutomataError::Cancelled);
+        }
         last_stats = step_typed(
             &current,
             &mut next,
@@ -1251,6 +1344,9 @@ fn run_typed<T: Symbol>(
             let remaining = config.cycles - generation;
             let required_steps = remaining % cycle.period;
             for _ in 0..required_steps {
+                if cancellation.is_some_and(|token| token.load(Ordering::Relaxed)) {
+                    return Err(DiscreteAutomataError::Cancelled);
+                }
                 last_stats = step_typed(
                     &current,
                     &mut next,

@@ -1,16 +1,18 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, sync::atomic::AtomicBool};
 
 use crate::continuous_automata::{
     CompiledContinuousLenia, CompiledContinuousStateInitializer, ContinuousAutomataError,
     ContinuousCompileLimits, ContinuousDomain, ContinuousLeniaProgram, ContinuousRunConfig,
     ContinuousSimulationResult, ContinuousStateInitializer, compile_continuous_lenia,
-    run_continuous_lenia,
+    run_continuous_lenia, run_continuous_lenia_with_cancellation,
+    validate_continuous_lenia_program,
 };
 use crate::discrete_automata::{
     CompactState, CompileLimits, CompiledDiscreteAutomaton, DiscreteAutomataError, DiscreteProgram,
     DiscreteRunConfig, DiscreteSimulationResult, compile_discrete_program, run_discrete_automaton,
+    run_discrete_automaton_with_cancellation, validate_discrete_program,
 };
 use crate::quantization::{
     CompiledHistogramStateInitializer, HistogramStateInitializer, IntensityCalibration,
@@ -202,6 +204,23 @@ impl CompiledDiscreteMapProgram {
             .compact_states_from_owned_bins(bin_ids, max_packed_state_bytes)
             .map_err(AutomataFrameworkError::Initializer)
     }
+
+    pub fn compact_initial_state_from_intensities(
+        &self,
+        calibration: IntensityCalibration,
+        intensities: &[u32],
+        max_packed_state_bytes: u64,
+    ) -> Result<CompactState, AutomataFrameworkError> {
+        if calibration != self.initializer.calibration() {
+            return Err(AutomataFrameworkError::CalibrationMismatch {
+                expected: self.initializer.calibration(),
+                actual: calibration,
+            });
+        }
+        self.initializer
+            .compact_states(intensities, max_packed_state_bytes)
+            .map_err(AutomataFrameworkError::Initializer)
+    }
 }
 
 impl CompiledContinuousLeniaProgram {
@@ -376,6 +395,7 @@ pub fn compile_automata_program(
                     found: program.version,
                 });
             }
+            validate_legacy_settings(&program.settings).map_err(AutomataFrameworkError::Legacy)?;
             Ok(CompiledAutomataProgram::LegacyEvidenceGrowthV1(
                 program.settings,
             ))
@@ -420,6 +440,57 @@ pub fn compile_automata_program(
     }
 }
 
+/// Validates a program document without consuming or cloning its potentially
+/// large dense tables. Run-record binding uses this path before accepting
+/// provenance supplied independently from execution.
+pub fn validate_automata_program_document(
+    document: &AutomataProgramDocument,
+    limits: AutomataCompileLimits,
+) -> Result<(), AutomataFrameworkError> {
+    if document.schema_version != AUTOMATA_PROGRAM_SCHEMA_VERSION {
+        return Err(AutomataFrameworkError::UnsupportedDocumentVersion {
+            found: document.schema_version,
+        });
+    }
+    match &document.transition_model {
+        AutomataModelDefinition::LegacyEvidenceGrowth(program) => {
+            if program.version != LEGACY_EVIDENCE_GROWTH_VERSION {
+                return Err(AutomataFrameworkError::UnsupportedLegacyModelVersion {
+                    found: program.version,
+                });
+            }
+            validate_legacy_settings(&program.settings).map_err(AutomataFrameworkError::Legacy)
+        }
+        AutomataModelDefinition::DiscreteMap(definition) => {
+            definition
+                .initializer
+                .validate()
+                .map_err(AutomataFrameworkError::Initializer)?;
+            if definition.initializer.state_count != definition.program.state_count {
+                return Err(
+                    AutomataFrameworkError::InitializerProgramStateCountMismatch {
+                        initializer: definition.initializer.state_count,
+                        program: definition.program.state_count,
+                    },
+                );
+            }
+            validate_discrete_program(&definition.program, limits.discrete)?;
+            Ok(())
+        }
+        AutomataModelDefinition::ContinuousLenia(definition) => {
+            let initializer = definition.initializer.compile()?;
+            if initializer.domain() != definition.program.domain {
+                return Err(AutomataFrameworkError::InitializerProgramDomainMismatch {
+                    initializer: initializer.domain(),
+                    program: definition.program.domain,
+                });
+            }
+            validate_continuous_lenia_program(&definition.program, limits.continuous)?;
+            Ok(())
+        }
+    }
+}
+
 /// Dispatches once on the model and state domain, outside every transition
 /// loop. A run cannot mix discrete and continuous/legacy state.
 pub fn run_compiled_automata(
@@ -448,6 +519,70 @@ pub fn run_compiled_automata(
         ) => Ok(AutomataSimulationResult::ContinuousLeniaV1(
             run_continuous_lenia(program.automaton(), state, width, height, config)?,
         )),
+        (CompiledAutomataProgram::LegacyEvidenceGrowthV1(_), input) => {
+            Err(AutomataFrameworkError::IncompatibleInput {
+                model: "legacy evidence-growth",
+                input: input.label(),
+            })
+        }
+        (CompiledAutomataProgram::DiscreteMapV1(_), input) => {
+            Err(AutomataFrameworkError::IncompatibleInput {
+                model: "discrete-map",
+                input: input.label(),
+            })
+        }
+        (CompiledAutomataProgram::ContinuousLeniaV1(_), input) => {
+            Err(AutomataFrameworkError::IncompatibleInput {
+                model: "continuous-lenia",
+                input: input.label(),
+            })
+        }
+    }
+}
+
+/// Runtime dispatcher with cooperative cancellation at generation
+/// boundaries. The token is execution control and is intentionally absent
+/// from persisted run specifications.
+pub fn run_compiled_automata_with_cancellation(
+    program: &CompiledAutomataProgram,
+    input: AutomataRunInput<'_>,
+    width: usize,
+    height: usize,
+    cancellation: &AtomicBool,
+) -> Result<AutomataSimulationResult, AutomataFrameworkError> {
+    match (program, input) {
+        (
+            CompiledAutomataProgram::DiscreteMapV1(program),
+            AutomataRunInput::DiscreteState { state, config },
+        ) => Ok(AutomataSimulationResult::DiscreteMapV1(
+            run_discrete_automaton_with_cancellation(
+                program.automaton(),
+                state,
+                width,
+                height,
+                config,
+                cancellation,
+            )?,
+        )),
+        (
+            CompiledAutomataProgram::ContinuousLeniaV1(program),
+            AutomataRunInput::ContinuousState { state, config },
+        ) => Ok(AutomataSimulationResult::ContinuousLeniaV1(
+            run_continuous_lenia_with_cancellation(
+                program.automaton(),
+                state,
+                width,
+                height,
+                config,
+                cancellation,
+            )?,
+        )),
+        (CompiledAutomataProgram::LegacyEvidenceGrowthV1(_), AutomataRunInput::LegacyImage(_)) => {
+            Err(AutomataFrameworkError::Legacy(
+                "The legacy compatibility model does not support cooperative cancellation."
+                    .to_owned(),
+            ))
+        }
         (CompiledAutomataProgram::LegacyEvidenceGrowthV1(_), input) => {
             Err(AutomataFrameworkError::IncompatibleInput {
                 model: "legacy evidence-growth",
@@ -630,6 +765,11 @@ fn validate_legacy_scalars(settings: &CellularAutomataSettings) -> Result<(), St
         return Err("Cellular automata response and evolution values must be finite.".to_owned());
     }
     Ok(())
+}
+
+fn validate_legacy_settings(settings: &CellularAutomataSettings) -> Result<(), String> {
+    validate_legacy_scalars(settings)?;
+    compile_cellular_kernels(settings).map(|_| ())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1167,6 +1307,44 @@ mod tests {
         };
         assert_eq!(result.final_state, [0.5, 1.0]);
         assert_eq!(result.cycles_completed, 2);
+    }
+
+    #[test]
+    fn cancellable_dispatch_stops_before_the_next_generation() {
+        let calibration = IntensityCalibration::full_scale(256).unwrap();
+        let compiled = compile_automata_program(
+            continuous_lenia_document(calibration),
+            AutomataCompileLimits::default(),
+        )
+        .unwrap();
+        let CompiledAutomataProgram::ContinuousLeniaV1(continuous) = &compiled else {
+            panic!("expected compiled continuous Lenia program")
+        };
+        let initial = continuous
+            .initial_state_from_intensities(calibration, &[0, 255], 8)
+            .unwrap();
+        let config = ContinuousRunConfig {
+            version: CONTINUOUS_RUN_CONFIG_VERSION,
+            cycles: 10,
+            ..ContinuousRunConfig::default()
+        };
+        let cancellation = AtomicBool::new(true);
+
+        assert!(matches!(
+            run_compiled_automata_with_cancellation(
+                &compiled,
+                AutomataRunInput::ContinuousState {
+                    state: &initial,
+                    config: &config,
+                },
+                2,
+                1,
+                &cancellation,
+            ),
+            Err(AutomataFrameworkError::Continuous(
+                ContinuousAutomataError::Cancelled
+            ))
+        ));
     }
 
     #[test]

@@ -10,13 +10,21 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use crate::analysis::processed_image_from_path;
-use crate::automata_lab::{AutomataLabSession, LabStepOutcome, LeniaLabSettings};
+use crate::automata::AutomataCompileLimits;
+use crate::automata_lab::{
+    AutomataLabSession, LabCapturePolicy, LabDiagnostics, LabExecutionPolicy, LabStepOutcome,
+    LeniaLabSettings,
+};
 use crate::automata_projection::{
     NumericProjectionSpec, OUTPUT_PROJECTION_VERSION, OverlayProjectionSpec, ProjectionLimits,
     ProjectionSource, ProjectionTransfer, project_continuous_state_overlay,
@@ -75,6 +83,8 @@ pub struct VCEMApp {
     processing_job: Option<ProcessingJob>,
     next_processing_job_id: u64,
     automata_lab_settings: LeniaLabSettings,
+    automata_lab_execution_policy: LabExecutionPolicy,
+    automata_lab_capture_policy: LabCapturePolicy,
     automata_lab_session: Option<AutomataLabSession>,
     automata_lab_job: Option<AutomataLabJob>,
     automata_lab_texture: Option<egui::TextureHandle>,
@@ -82,7 +92,7 @@ pub struct VCEMApp {
     automata_lab_steps_per_second: f32,
     automata_lab_cycles_per_step: u32,
     automata_lab_last_step: Instant,
-    automata_lab_candidate_name: String,
+    automata_lab_bookmark_name: String,
     automata_lab_error: Option<String>,
     automata_lab_notice: Option<String>,
 }
@@ -103,6 +113,8 @@ struct ProcessingJob {
 
 struct AutomataLabJob {
     receiver: Receiver<Result<(AutomataLabSession, LabStepOutcome), String>>,
+    cancellation: Arc<AtomicBool>,
+    discard_result: bool,
 }
 
 struct ProcessingResult {
@@ -245,6 +257,8 @@ impl VCEMApp {
             processing_job: None,
             next_processing_job_id: 1,
             automata_lab_settings: LeniaLabSettings::default(),
+            automata_lab_execution_policy: LabExecutionPolicy::default(),
+            automata_lab_capture_policy: LabCapturePolicy::default(),
             automata_lab_session: None,
             automata_lab_job: None,
             automata_lab_texture: None,
@@ -252,7 +266,7 @@ impl VCEMApp {
             automata_lab_steps_per_second: 10.0,
             automata_lab_cycles_per_step: 1,
             automata_lab_last_step: Instant::now(),
-            automata_lab_candidate_name: "Candidate 1".to_owned(),
+            automata_lab_bookmark_name: "Bookmark 1".to_owned(),
             automata_lab_error: None,
             automata_lab_notice: None,
         }
@@ -1107,21 +1121,37 @@ impl VCEMApp {
                             egui::Slider::new(&mut self.automata_lab_steps_per_second, 1.0..=60.0)
                                 .text("Steps / second"),
                         );
-                        ui.add(
+                        let checkpoint_response = ui.add(
                             egui::Slider::new(
-                                &mut self.automata_lab_settings.checkpoint_interval,
+                                &mut self.automata_lab_capture_policy.checkpoint_interval,
                                 1..=100,
                             )
                             .text("Checkpoint interval"),
                         );
+                        if checkpoint_response.changed() {
+                            self.cancel_automata_lab_job();
+                            if let Some(session) = self.automata_lab_session.as_mut()
+                                && let Err(error) =
+                                    session.set_capture_policy(self.automata_lab_capture_policy)
+                            {
+                                self.automata_lab_error = Some(error.to_string());
+                                self.automata_lab_capture_policy = session.capture_policy();
+                            }
+                        }
                     });
 
-                    let settings_dirty = self
-                        .automata_lab_session
-                        .as_ref()
-                        .is_some_and(|session| session.settings() != &self.automata_lab_settings);
+                    let authored_program = self.displayed_image.as_ref().and_then(|displayed| {
+                        self.automata_lab_settings
+                            .program_document(displayed.calibration)
+                            .ok()
+                    });
+                    let settings_dirty =
+                        self.automata_lab_session.as_ref().is_some_and(|session| {
+                            authored_program.as_ref() != Some(session.program_document())
+                        });
                     if settings_dirty {
                         self.automata_lab_playing = false;
+                        self.cancel_automata_lab_job();
                         ui.colored_label(
                             Color32::YELLOW,
                             "Settings changed; apply them to rebuild generation zero.",
@@ -1176,7 +1206,15 @@ impl VCEMApp {
                     if is_stepping {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label("Computing the next state…");
+                            if self
+                                .automata_lab_job
+                                .as_ref()
+                                .is_some_and(|job| job.discard_result)
+                            {
+                                ui.label("Cancelling computation…");
+                            } else {
+                                ui.label("Computing the next state…");
+                            }
                         });
                     }
 
@@ -1191,15 +1229,36 @@ impl VCEMApp {
                         ui.separator();
                         ui.strong(format!("Generation {}", session.generation()));
                         if let Some(diagnostics) = session.last_diagnostics() {
-                            ui.label(format!(
-                                "Mean {:.4}, mass {:.2}",
-                                diagnostics.final_mean, diagnostics.final_mass
-                            ));
-                            if let Some(delta) = diagnostics.last_transition_max_delta {
-                                ui.label(format!("Last max delta {delta:.6}"));
-                            }
-                            if let Some(generation) = diagnostics.exact_fixed_point_generation {
-                                ui.label(format!("Exact fixed point from generation {generation}"));
+                            match diagnostics {
+                                LabDiagnostics::Continuous(diagnostics) => {
+                                    ui.label(format!(
+                                        "Mean {:.4}, mass {:.2}",
+                                        diagnostics.final_mean, diagnostics.final_mass
+                                    ));
+                                    if let Some(delta) = diagnostics.last_transition_max_delta {
+                                        ui.label(format!("Last max delta {delta:.6}"));
+                                    }
+                                    if let Some(generation) =
+                                        diagnostics.exact_fixed_point_generation
+                                    {
+                                        ui.label(format!(
+                                            "Exact fixed point from generation {generation}"
+                                        ));
+                                    }
+                                }
+                                LabDiagnostics::Discrete(diagnostics) => {
+                                    ui.label(format!(
+                                        "{} non-zero cells, {} changed in the last transition",
+                                        diagnostics.final_nonzero_cells,
+                                        diagnostics.last_transition_changed_cells
+                                    ));
+                                    if let Some(cycle) = diagnostics.cycle {
+                                        ui.label(format!(
+                                            "Cycle period {} from generation {}",
+                                            cycle.period, cycle.start_generation
+                                        ));
+                                    }
+                                }
                             }
                         }
                         ui.label(format!(
@@ -1243,30 +1302,30 @@ impl VCEMApp {
 
                     if has_session {
                         ui.separator();
-                        ui.collapsing("Candidate snapshots", |ui| {
-                            ui.text_edit_singleline(&mut self.automata_lab_candidate_name);
+                        ui.collapsing("State bookmarks", |ui| {
+                            ui.text_edit_singleline(&mut self.automata_lab_bookmark_name);
                             if ui
                                 .add_enabled(!is_stepping, Button::new("Save Current"))
                                 .clicked()
                             {
-                                self.save_automata_lab_candidate();
+                                self.save_automata_lab_bookmark();
                             }
-                            let candidates = self
+                            let bookmarks = self
                                 .automata_lab_session
                                 .as_ref()
                                 .map(|session| {
                                     session
-                                        .candidates()
+                                        .bookmarks()
                                         .iter()
                                         .enumerate()
-                                        .map(|(index, candidate)| {
-                                            (index, candidate.name.clone(), candidate.generation)
+                                        .map(|(index, bookmark)| {
+                                            (index, bookmark.name.clone(), bookmark.generation)
                                         })
                                         .collect::<Vec<_>>()
                                 })
                                 .unwrap_or_default();
                             let mut restore = None;
-                            for (index, name, generation) in candidates {
+                            for (index, name, generation) in bookmarks {
                                 if ui
                                     .add_enabled(
                                         !is_stepping,
@@ -1278,7 +1337,7 @@ impl VCEMApp {
                                 }
                             }
                             if let Some(index) = restore {
-                                self.restore_automata_lab_candidate(ui.ctx(), index);
+                                self.restore_automata_lab_bookmark(ui.ctx(), index);
                             }
                         });
                     }
@@ -1382,7 +1441,7 @@ impl VCEMApp {
 
     fn initialize_automata_lab(&mut self, ctx: &egui::Context) {
         self.automata_lab_playing = false;
-        self.automata_lab_job = None;
+        self.cancel_automata_lab_job();
         self.automata_lab_error = None;
         self.automata_lab_notice = None;
 
@@ -1394,11 +1453,24 @@ impl VCEMApp {
             return;
         };
         let size = [displayed.size.x as usize, displayed.size.y as usize];
+        let program_document = match self
+            .automata_lab_settings
+            .program_document(displayed.calibration)
+        {
+            Ok(program) => program,
+            Err(error) => {
+                self.automata_lab_error = Some(error.to_string());
+                return;
+            }
+        };
         match AutomataLabSession::new(
             &displayed.prepared_values,
             displayed.calibration,
             size,
-            self.automata_lab_settings.clone(),
+            program_document,
+            AutomataCompileLimits::default(),
+            self.automata_lab_execution_policy,
+            self.automata_lab_capture_policy,
         ) {
             Ok(session) => {
                 self.automata_lab_session = Some(session);
@@ -1417,7 +1489,7 @@ impl VCEMApp {
 
     fn reset_automata_lab(&mut self, ctx: &egui::Context) {
         self.automata_lab_playing = false;
-        self.automata_lab_job = None;
+        self.cancel_automata_lab_job();
         self.automata_lab_error = None;
         self.automata_lab_notice = None;
         if let Some(session) = self.automata_lab_session.as_mut() {
@@ -1438,16 +1510,22 @@ impl VCEMApp {
             return;
         };
         let (sender, receiver) = mpsc::channel();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
         let repaint_ctx = ctx.clone();
         thread::spawn(move || {
             let result = session
-                .step(cycles)
+                .step_with_cancellation(cycles, &worker_cancellation)
                 .map(|outcome| (session, outcome))
                 .map_err(|error| error.to_string());
             let _ = sender.send(result);
             repaint_ctx.request_repaint();
         });
-        self.automata_lab_job = Some(AutomataLabJob { receiver });
+        self.automata_lab_job = Some(AutomataLabJob {
+            receiver,
+            cancellation,
+            discard_result: false,
+        });
         ctx.request_repaint();
     }
 
@@ -1455,6 +1533,7 @@ impl VCEMApp {
         let Some(job) = self.automata_lab_job.as_ref() else {
             return;
         };
+        let discard_result = job.discard_result;
         let result = match job.receiver.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => {
@@ -1466,14 +1545,17 @@ impl VCEMApp {
             }
         };
         self.automata_lab_job = None;
+        if discard_result {
+            return;
+        }
         match result {
             Ok((session, outcome)) => {
                 self.automata_lab_session = Some(session);
-                if outcome.checkpoint_skipped_for_budget {
-                    self.automata_lab_notice = Some(
-                        "The step completed, but its timeline checkpoint exceeded the history budget."
-                            .to_owned(),
-                    );
+                if outcome.checkpoints_skipped_for_budget > 0 {
+                    self.automata_lab_notice = Some(format!(
+                        "The step completed, but {} timeline checkpoint(s) exceeded the history budget.",
+                        outcome.checkpoints_skipped_for_budget
+                    ));
                 }
                 self.refresh_automata_lab_texture(ctx);
             }
@@ -1506,33 +1588,33 @@ impl VCEMApp {
         }
     }
 
-    fn save_automata_lab_candidate(&mut self) {
+    fn save_automata_lab_bookmark(&mut self) {
         self.automata_lab_error = None;
         self.automata_lab_notice = None;
-        let name = self.automata_lab_candidate_name.trim().to_owned();
+        let name = self.automata_lab_bookmark_name.trim().to_owned();
         let result = self
             .automata_lab_session
             .as_mut()
             .ok_or_else(|| "Initialize the Automata Lab first.".to_owned())
             .and_then(|session| {
                 session
-                    .save_candidate(&name)
+                    .save_bookmark(&name)
                     .map_err(|error| error.to_string())
             });
         match result {
             Ok(()) => {
-                let candidate_number = self
+                let bookmark_number = self
                     .automata_lab_session
                     .as_ref()
-                    .map_or(1, |session| session.candidates().len() + 1);
-                self.automata_lab_candidate_name = format!("Candidate {candidate_number}");
-                self.automata_lab_notice = Some(format!("Saved candidate {name:?}."));
+                    .map_or(1, |session| session.bookmarks().len() + 1);
+                self.automata_lab_bookmark_name = format!("Bookmark {bookmark_number}");
+                self.automata_lab_notice = Some(format!("Saved state bookmark {name:?}."));
             }
             Err(error) => self.automata_lab_error = Some(error),
         }
     }
 
-    fn restore_automata_lab_candidate(&mut self, ctx: &egui::Context, index: usize) {
+    fn restore_automata_lab_bookmark(&mut self, ctx: &egui::Context, index: usize) {
         self.automata_lab_playing = false;
         self.automata_lab_error = None;
         self.automata_lab_notice = None;
@@ -1542,12 +1624,12 @@ impl VCEMApp {
             .ok_or_else(|| "Initialize the Automata Lab first.".to_owned())
             .and_then(|session| {
                 session
-                    .restore_candidate(index)
+                    .restore_bookmark(index)
                     .map_err(|error| error.to_string())
             });
         match result {
             Ok(()) => {
-                self.automata_lab_notice = Some("Restored candidate snapshot.".to_owned());
+                self.automata_lab_notice = Some("Restored state bookmark.".to_owned());
                 self.refresh_automata_lab_texture(ctx);
             }
             Err(error) => self.automata_lab_error = Some(error),
@@ -1569,8 +1651,16 @@ impl VCEMApp {
             color: [48, 221, 255],
             maximum_alpha: 224,
         };
+        let Some(state) = session.continuous_state() else {
+            self.automata_lab_texture = None;
+            self.automata_lab_error = Some(
+                "The discrete Lab projection will be provided with discrete authoring controls."
+                    .to_owned(),
+            );
+            return;
+        };
         match project_continuous_state_overlay(
-            session.current_state(),
+            state,
             session.size(),
             ContinuousDomain::UNIT,
             &specification,
@@ -1610,11 +1700,18 @@ impl VCEMApp {
 
     fn invalidate_automata_lab(&mut self) {
         self.automata_lab_playing = false;
-        self.automata_lab_job = None;
+        self.cancel_automata_lab_job();
         self.automata_lab_session = None;
         self.automata_lab_texture = None;
         self.automata_lab_error = None;
         self.automata_lab_notice = None;
+    }
+
+    fn cancel_automata_lab_job(&mut self) {
+        if let Some(job) = self.automata_lab_job.as_mut() {
+            job.cancellation.store(true, Ordering::Relaxed);
+            job.discard_result = true;
+        }
     }
 
     fn show_bottom_panel(&mut self, ui: &mut Ui) {

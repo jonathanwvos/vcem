@@ -1,7 +1,7 @@
 # Automata Lab architecture decision
 
 - **Status:** Accepted direction; staged implementation
-- **Date:** 2026-08-17
+- **Date:** 2026-08-18
 - **Scope:** Cellular-automata execution, experiment lineage, and result representation
 
 ## Implementation status
@@ -13,9 +13,12 @@
 - Stage 2B is complete: `ContinuousLenia` is a real strict program variant with calibrated continuous initialization, a dense anchored kernel, explicit normalization and boundary policies, built-in growth functions, synchronous parallel evolution, clamped numeric results, and convergence diagnostics.
 - Continuous execution is autonomous after generation zero and contains neither source-evidence gating nor an independent decay term. Exact fixed points may be safely fast-forwarded; approximate convergence is diagnostic only and never shortens the requested run.
 - Stage 3 is complete at the engine boundary. Versioned projections derive normalized scalar fields, discrete-state membership, masks, and RGBA overlays from any validated final result without rerunning a model. The normal legacy overlay now uses this projection path with its original palette and square-root alpha transfer.
-- Versioned run records bind an immutable prepared-plane identity, source identity, calibration, experiment/ROI lineage, complete program document, model-specific run specification, optional deterministic seed, and validated numeric result.
-- The first Stage 4 interactive slice is complete for continuous Lenia. A dedicated Automata Lab view retains the selected image's calibrated prepared plane, initializes generation zero from that plane, renders the current numeric state as a disposable superimposed projection, and exposes Reset, background-threaded Step, timed Play/Pause, diagnostics, budgeted in-memory timeline checkpoints, and named candidate snapshots.
-- Lab sessions are invalidated when image selection or preprocessing changes, so a state cannot silently outlive the prepared plane that initialized it. Editing transition settings pauses playback and requires an explicit apply-and-reset operation. Persisted Lab experiments, discrete rule authoring, richer timeline capture, and ROI child tabs remain subsequent Stage 4/5 work.
+- Versioned run records bind an immutable prepared-plane identity, source identity, calibration, experiment/ROI lineage, complete program document, model-specific run specification, optional deterministic seed, and validated numeric result. Record creation revalidates the borrowed program under explicit compile limits and rejects result dimensions, state cardinality/domain, cycle counts, or diagnostics that disagree with the recorded program and run specification.
+- The first Stage 4 interactive slice is complete for continuous Lenia. A dedicated Automata Lab view retains the selected image's calibrated prepared plane, initializes generation zero from that plane, renders the current numeric state as a disposable superimposed projection, and exposes Reset, background-threaded Step, timed Play/Pause, diagnostics, budgeted in-memory timeline checkpoints, and named state bookmarks.
+- The consolidation pass removed the Lab's parallel model format and runner. A session now owns the same strict `AutomataProgramDocument` and compiled dispatcher used at the engine boundary; both discrete-map and continuous-Lenia programs run through that session, while the current UI remains a continuous-Lenia authoring facade. Editable Lenia controls are an unpersisted adapter that produces the shared document.
+- Execution policy and capture policy are separate from model identity. Checkpoints are captured at exact generation multiples even when one UI step crosses several intervals; changing capture cadence does not reset or recompile the automaton. State buffers and dense compiled tables are shared across session clones where possible and history is bounded by an explicit byte budget.
+- Lab computation is cooperatively cancellable at every generation and commits atomically. Resetting, changing settings, or changing the prepared source marks the single outstanding worker result for discard and signals cancellation; a second worker is not started until the first exits.
+- Lab sessions are invalidated when image selection or preprocessing changes, so a state cannot silently outlive the prepared plane that initialized it. Editing transition settings pauses playback and requires an explicit apply-and-reset operation. Persisted Lab experiments, discrete rule authoring controls, temporal result projections, and ROI child tabs remain subsequent Stage 4/5 work.
 
 ## Context
 
@@ -109,7 +112,7 @@ The canonical result is numeric rather than an RGBA texture. A `SimulationResult
 
 Rendering is a downstream projection. An `OutputProjection` can reproduce the current superimposed overlay, but changing its palette, threshold, opacity, or selected states does not rerun or mutate the automaton. Numeric projections also provide the future inputs for validated-model composition, including masks, final activation, temporal maxima, occupancy, and change frequency.
 
-Projection v1 implements normalized final-state fields for all three model families, discrete-state membership, threshold masks, and configurable single-colour RGBA overlays. Transfer functions are identity, power, and linear windowing. Temporal projections remain deferred until checkpoint capture exists in Stage 4.
+Projection v1 implements normalized final-state fields for all three model families, discrete-state membership, threshold masks, and configurable single-colour RGBA overlays. Transfer functions are identity, power, and linear windowing. Timeline checkpoints now exist in the interactive Lab, but converting captured histories into persisted temporal projections remains deferred.
 
 ### Experiments and ROI lineage
 
@@ -177,7 +180,7 @@ The compiled transition API conceptually reads `current` and writes `next`; the 
 1. Extract a pure CA engine that returns numeric state independently of egui and texture rendering.
 2. Add versioned `LegacyEvidenceGrowth`, `DiscreteMap`, and `ContinuousLenia` variants.
 3. Add initializer/calibration, histogram-bin states, boundary policy, deterministic seeds, and output projections.
-4. Add Reset/Step/Play, timeline checkpoints, diagnostics, and named candidate snapshots in Automata Lab.
+4. Add Reset/Step/Play, timeline checkpoints, diagnostics, and named state bookmarks in Automata Lab.
 5. Add child ROI experiment tabs, context halos, lineage, and result-layer composition foundations.
 6. Add curve sketching and then the whitelisted expression language.
 7. Add preserve/suppress/ignore rewards, exhaustive scans where tractable, and quality-diversity/evolutionary search.

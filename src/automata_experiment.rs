@@ -3,8 +3,9 @@ use std::fmt;
 
 use crate::{
     automata::{
-        AUTOMATA_PROGRAM_SCHEMA_VERSION, AutomataModelDefinition, AutomataProgramDocument,
-        AutomataSimulationResult, LEGACY_EVIDENCE_GROWTH_VERSION,
+        AUTOMATA_PROGRAM_SCHEMA_VERSION, AutomataCompileLimits, AutomataModelDefinition,
+        AutomataProgramDocument, AutomataSimulationResult, LEGACY_EVIDENCE_GROWTH_VERSION,
+        validate_automata_program_document,
     },
     automata_projection::validate_simulation_result,
     continuous_automata::{
@@ -113,6 +114,7 @@ pub enum RunRecordError {
         size: [u32; 2],
     },
     InvalidCalibration(String),
+    InvalidProgram(String),
     InvalidRoi {
         reason: &'static str,
     },
@@ -140,6 +142,11 @@ pub enum RunRecordError {
         requested: u32,
         completed: u32,
     },
+    DiscreteStateCountMismatch {
+        program: u32,
+        result: u32,
+    },
+    ContinuousDomainMismatch,
     InvalidResult(String),
 }
 
@@ -170,6 +177,7 @@ impl fmt::Display for RunRecordError {
                 size[0], size[1]
             ),
             Self::InvalidCalibration(error) => formatter.write_str(error),
+            Self::InvalidProgram(error) => write!(formatter, "Invalid automata program: {error}"),
             Self::InvalidRoi { reason } => write!(formatter, "Invalid parent ROI: {reason}."),
             Self::InitializerCalibrationMismatch {
                 source,
@@ -204,6 +212,13 @@ impl fmt::Display for RunRecordError {
                 formatter,
                 "Result completed {completed} cycles, but the run requested {requested}."
             ),
+            Self::DiscreteStateCountMismatch { program, result } => write!(
+                formatter,
+                "Discrete result uses {result} states, but the recorded program uses {program}."
+            ),
+            Self::ContinuousDomainMismatch => formatter.write_str(
+                "Continuous result domain does not match the recorded Lenia program domain.",
+            ),
             Self::InvalidResult(error) => write!(formatter, "Invalid simulation result: {error}"),
         }
     }
@@ -215,9 +230,18 @@ pub fn record_completed_run(
     provenance: AutomataRunProvenance,
     result: AutomataSimulationResult,
 ) -> Result<AutomataRunRecord, RunRecordError> {
-    validate_provenance(&provenance)?;
+    record_completed_run_with_limits(provenance, result, AutomataCompileLimits::default())
+}
+
+pub fn record_completed_run_with_limits(
+    provenance: AutomataRunProvenance,
+    result: AutomataSimulationResult,
+    compile_limits: AutomataCompileLimits,
+) -> Result<AutomataRunRecord, RunRecordError> {
+    validate_provenance_with_limits(&provenance, compile_limits)?;
     validate_simulation_result(&result)
         .map_err(|error| RunRecordError::InvalidResult(error.to_string()))?;
+    validate_result_diagnostics(&result)?;
     validate_result_binding(&provenance, &result)?;
     Ok(AutomataRunRecord {
         schema_version: AUTOMATA_RUN_RECORD_VERSION,
@@ -227,6 +251,13 @@ pub fn record_completed_run(
 }
 
 pub fn validate_provenance(provenance: &AutomataRunProvenance) -> Result<(), RunRecordError> {
+    validate_provenance_with_limits(provenance, AutomataCompileLimits::default())
+}
+
+pub fn validate_provenance_with_limits(
+    provenance: &AutomataRunProvenance,
+    compile_limits: AutomataCompileLimits,
+) -> Result<(), RunRecordError> {
     if provenance.schema_version != AUTOMATA_RUN_PROVENANCE_VERSION {
         return Err(RunRecordError::UnsupportedProvenanceVersion {
             found: provenance.schema_version,
@@ -327,6 +358,8 @@ pub fn validate_provenance(provenance: &AutomataRunProvenance) -> Result<(), Run
             }
         }
     }
+    validate_automata_program_document(&provenance.program, compile_limits)
+        .map_err(|error| RunRecordError::InvalidProgram(error.to_string()))?;
     Ok(())
 }
 
@@ -349,25 +382,213 @@ fn validate_result_binding(
         result,
     ) {
         (
-            AutomataModelDefinition::LegacyEvidenceGrowth(_),
+            AutomataModelDefinition::LegacyEvidenceGrowth(program),
             AutomataRunSpec::LegacyEvidenceGrowthV1,
-            AutomataSimulationResult::LegacyEvidenceGrowthV1(_),
-        ) => Ok(()),
+            AutomataSimulationResult::LegacyEvidenceGrowthV1(result),
+        ) => {
+            if program.settings.iterations.clamp(1, 512) != result.summary.iterations_run {
+                return Err(RunRecordError::InvalidResult(
+                    "Legacy iterations run do not match the recorded program.".to_owned(),
+                ));
+            }
+            Ok(())
+        }
         (
-            AutomataModelDefinition::DiscreteMap(_),
+            AutomataModelDefinition::DiscreteMap(definition),
             AutomataRunSpec::DiscreteMapV1(config),
             AutomataSimulationResult::DiscreteMapV1(result),
-        ) => require_completed_cycles(config.cycles, result.cycles_completed),
+        ) => {
+            require_completed_cycles(config.cycles, result.cycles_completed)?;
+            if definition.program.state_count != result.state_count {
+                return Err(RunRecordError::DiscreteStateCountMismatch {
+                    program: definition.program.state_count,
+                    result: result.state_count,
+                });
+            }
+            Ok(())
+        }
         (
-            AutomataModelDefinition::ContinuousLenia(_),
+            AutomataModelDefinition::ContinuousLenia(definition),
             AutomataRunSpec::ContinuousLeniaV1(config),
             AutomataSimulationResult::ContinuousLeniaV1(result),
-        ) => require_completed_cycles(config.cycles, result.cycles_completed),
+        ) => {
+            require_completed_cycles(config.cycles, result.cycles_completed)?;
+            if definition.program.domain != result.domain {
+                return Err(RunRecordError::ContinuousDomainMismatch);
+            }
+            let expected_within_tolerance = result
+                .diagnostics
+                .last_transition_max_delta
+                .map(|delta| delta <= config.convergence_tolerance);
+            if result.diagnostics.last_transition_within_tolerance != expected_within_tolerance {
+                return Err(RunRecordError::InvalidResult(
+                    "Continuous tolerance diagnostics do not match the recorded run specification."
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        }
         (program, _, result) => Err(RunRecordError::ModelResultMismatch {
             program: program_name(program),
             result: result_name(result),
         }),
     }
+}
+
+fn validate_result_diagnostics(result: &AutomataSimulationResult) -> Result<(), RunRecordError> {
+    let invalid = |message: &str| RunRecordError::InvalidResult(message.to_owned());
+    match result {
+        AutomataSimulationResult::LegacyEvidenceGrowthV1(result) => {
+            let count = result.state.len();
+            let mean = result.state.iter().map(|value| *value as f64).sum::<f64>() / count as f64;
+            let active =
+                result.state.iter().filter(|value| **value >= 0.1).count() as f64 / count as f64;
+            if result.summary.iterations_run == 0
+                || !approximately_equal(result.summary.mean_activation as f64, mean)
+                || !approximately_equal(result.summary.active_fraction as f64, active)
+            {
+                return Err(invalid(
+                    "Legacy result summary does not match its numeric state.",
+                ));
+            }
+        }
+        AutomataSimulationResult::DiscreteMapV1(result) => {
+            let nonzero = (0..result.final_state.len())
+                .filter(|index| {
+                    result
+                        .final_state
+                        .get(*index)
+                        .is_some_and(|value| value != 0)
+                })
+                .count();
+            if nonzero != result.diagnostics.final_nonzero_cells
+                || result.diagnostics.last_transition_changed_cells > result.final_state.len()
+                || result.diagnostics.transition_steps_executed > result.cycles_completed
+                || (result.cycles_completed == 0
+                    && (result.diagnostics.transition_steps_executed != 0
+                        || result.diagnostics.fixed_point_generation.is_some()
+                        || result.diagnostics.cycle.is_some()))
+                || (result.cycles_completed > 0
+                    && (result.diagnostics.transition_steps_executed == 0
+                        || (result.diagnostics.last_transition_changed_cells == 0
+                            && result.diagnostics.fixed_point_generation.is_none())))
+            {
+                return Err(invalid(
+                    "Discrete result diagnostics do not match its numeric state or cycle count.",
+                ));
+            }
+            if let Some(generation) = result.diagnostics.fixed_point_generation
+                && generation >= result.cycles_completed
+            {
+                return Err(invalid(
+                    "Discrete fixed-point generation is outside the completed run.",
+                ));
+            }
+            if let Some(cycle) = result.diagnostics.cycle {
+                let expected_repeat = cycle.start_generation.checked_add(cycle.period);
+                if cycle.period == 0
+                    || expected_repeat != Some(cycle.first_repeat_generation)
+                    || cycle.first_repeat_generation > result.cycles_completed
+                {
+                    return Err(invalid(
+                        "Discrete cycle diagnostics are internally inconsistent.",
+                    ));
+                }
+                if result.diagnostics.distinct_states_observed
+                    != Some(u64::from(cycle.first_repeat_generation))
+                {
+                    return Err(invalid(
+                        "Discrete distinct-state diagnostics disagree with the detected cycle.",
+                    ));
+                }
+                match (cycle.period, result.diagnostics.fixed_point_generation) {
+                    (1, Some(generation)) if generation == cycle.start_generation => {}
+                    (1, _) => {
+                        return Err(invalid(
+                            "Discrete fixed-point and period-one diagnostics disagree.",
+                        ));
+                    }
+                    (_, Some(_)) => {
+                        return Err(invalid(
+                            "Discrete fixed-point diagnostics cannot describe a multi-state cycle.",
+                        ));
+                    }
+                    (_, None) => {}
+                }
+            } else if result.diagnostics.fixed_point_generation.is_some() {
+                return Err(invalid(
+                    "Discrete fixed-point diagnostics require a matching period-one cycle.",
+                ));
+            }
+        }
+        AutomataSimulationResult::ContinuousLeniaV1(result) => {
+            let mut minimum = f32::INFINITY;
+            let mut maximum = f32::NEG_INFINITY;
+            let mut mass = 0.0_f64;
+            for value in &result.final_state {
+                minimum = minimum.min(*value);
+                maximum = maximum.max(*value);
+                mass += *value as f64;
+            }
+            let mean = mass / result.final_state.len() as f64;
+            if result.diagnostics.transition_steps_executed > result.cycles_completed
+                || result.diagnostics.final_minimum != minimum
+                || result.diagnostics.final_maximum != maximum
+                || !approximately_equal(result.diagnostics.final_mean as f64, mean)
+                || !approximately_equal(result.diagnostics.final_mass, mass)
+            {
+                return Err(invalid(
+                    "Continuous result diagnostics do not match its numeric state or cycle count.",
+                ));
+            }
+            if let Some(generation) = result.diagnostics.exact_fixed_point_generation
+                && generation >= result.cycles_completed
+            {
+                return Err(invalid(
+                    "Continuous fixed-point generation is outside the completed run.",
+                ));
+            }
+            match (
+                result.diagnostics.transition_steps_executed,
+                result.diagnostics.last_transition_max_delta,
+                result.diagnostics.last_transition_within_tolerance,
+                result.diagnostics.exact_fixed_point_generation,
+            ) {
+                (0, None, None, None) if result.cycles_completed == 0 => {}
+                (0, _, _, _) => {
+                    return Err(invalid(
+                        "Continuous zero-step diagnostics contain transition measurements.",
+                    ));
+                }
+                (_, Some(delta), Some(_), fixed) => {
+                    if (delta == 0.0) != fixed.is_some() {
+                        return Err(invalid(
+                            "Continuous exact fixed-point diagnostics disagree with the final transition delta.",
+                        ));
+                    }
+                    if let Some(generation) = fixed
+                        && generation.checked_add(1)
+                            != Some(result.diagnostics.transition_steps_executed)
+                    {
+                        return Err(invalid(
+                            "Continuous fixed-point generation disagrees with transitions executed.",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(invalid(
+                        "Continuous transition diagnostics are only partially populated.",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn approximately_equal(left: f64, right: f64) -> bool {
+    let scale = left.abs().max(right.abs()).max(1.0);
+    (left - right).abs() <= 1.0e-6 * scale
 }
 
 fn require_identifier(value: &str, field: &'static str) -> Result<(), RunRecordError> {
@@ -468,7 +689,7 @@ mod tests {
     use crate::{
         automata::{
             AUTOMATA_PROGRAM_SCHEMA_VERSION, AutomataModelDefinition,
-            ContinuousLeniaProgramDefinition,
+            ContinuousLeniaProgramDefinition, DiscreteMapProgram,
         },
         continuous_automata::{
             CONTINUOUS_INITIALIZER_VERSION, CONTINUOUS_LENIA_PROGRAM_VERSION,
@@ -477,7 +698,12 @@ mod tests {
             ContinuousSimulationResult, ContinuousStateInitializer, DenseContinuousKernel,
             KernelNormalization,
         },
-        discrete_automata::DiscreteRunConfig,
+        discrete_automata::{
+            BoundaryPolicy, CompactState, DISCRETE_PROGRAM_VERSION, DISCRETE_RESULT_VERSION,
+            DiscreteDiagnostics, DiscreteProgram, DiscreteRule, DiscreteRunConfig,
+            DiscreteSimulationResult, StateStorage,
+        },
+        quantization::HistogramStateInitializer,
     };
 
     fn continuous_provenance() -> AutomataRunProvenance {
@@ -554,6 +780,62 @@ mod tests {
                 final_maximum: 0.75,
                 final_mean: 0.5,
                 final_mass: 1.0,
+            },
+        })
+    }
+
+    fn discrete_provenance() -> AutomataRunProvenance {
+        let calibration = IntensityCalibration::full_scale(256).unwrap();
+        AutomataRunProvenance {
+            schema_version: AUTOMATA_RUN_PROVENANCE_VERSION,
+            run_id: "run-discrete".to_owned(),
+            lineage: ExperimentLineage {
+                experiment_id: "experiment-discrete".to_owned(),
+                experiment_revision: 1,
+                parent: None,
+            },
+            source: PreparedSourceReference {
+                source_id: "sha256:source".to_owned(),
+                prepared_plane_id: "sha256:prepared-plane".to_owned(),
+                size: [2, 1],
+                calibration,
+            },
+            program: AutomataProgramDocument {
+                schema_version: AUTOMATA_PROGRAM_SCHEMA_VERSION,
+                transition_model: AutomataModelDefinition::DiscreteMap(DiscreteMapProgram {
+                    initializer: HistogramStateInitializer::identity(calibration, 2),
+                    program: DiscreteProgram {
+                        version: DISCRETE_PROGRAM_VERSION,
+                        state_count: 2,
+                        storage: StateStorage::U8,
+                        kernel: Vec::new(),
+                        boundary: BoundaryPolicy::Wrap,
+                        rule: DiscreteRule::Direct {
+                            table: CompactState::U8(vec![0, 1]),
+                        },
+                    },
+                }),
+            },
+            run_spec: AutomataRunSpec::DiscreteMapV1(DiscreteRunConfig::new(2)),
+            random_seed: None,
+        }
+    }
+
+    fn discrete_result(state_count: u32) -> AutomataSimulationResult {
+        AutomataSimulationResult::DiscreteMapV1(DiscreteSimulationResult {
+            version: DISCRETE_RESULT_VERSION,
+            size: [2, 1],
+            state_count,
+            storage: StateStorage::U8,
+            cycles_completed: 2,
+            final_state: CompactState::U8(vec![0, 1]),
+            diagnostics: DiscreteDiagnostics {
+                transition_steps_executed: 2,
+                distinct_states_observed: None,
+                fixed_point_generation: None,
+                cycle: None,
+                final_nonzero_cells: 1,
+                last_transition_changed_cells: 1,
             },
         })
     }
@@ -647,6 +929,52 @@ mod tests {
         result.final_state[0] = f32::NAN;
         assert!(matches!(
             record_completed_run(continuous_provenance(), invalid_numeric),
+            Err(RunRecordError::InvalidResult(_))
+        ));
+    }
+
+    #[test]
+    fn record_rejects_invalid_programs_result_domains_state_counts_and_diagnostics() {
+        let mut invalid_program = continuous_provenance();
+        let AutomataModelDefinition::ContinuousLenia(definition) =
+            &mut invalid_program.program.transition_model
+        else {
+            unreachable!()
+        };
+        definition.program.kernel.weights.clear();
+        assert!(matches!(
+            record_completed_run(invalid_program, continuous_result(2)),
+            Err(RunRecordError::InvalidProgram(_))
+        ));
+
+        let mut wrong_domain = continuous_result(2);
+        let AutomataSimulationResult::ContinuousLeniaV1(result) = &mut wrong_domain else {
+            unreachable!()
+        };
+        result.domain = ContinuousDomain {
+            minimum: -1.0,
+            maximum: 1.0,
+        };
+        assert!(matches!(
+            record_completed_run(continuous_provenance(), wrong_domain),
+            Err(RunRecordError::ContinuousDomainMismatch)
+        ));
+
+        assert!(matches!(
+            record_completed_run(discrete_provenance(), discrete_result(3)),
+            Err(RunRecordError::DiscreteStateCountMismatch {
+                program: 2,
+                result: 3,
+            })
+        ));
+
+        let mut inconsistent = continuous_result(2);
+        let AutomataSimulationResult::ContinuousLeniaV1(result) = &mut inconsistent else {
+            unreachable!()
+        };
+        result.diagnostics.final_mass = 9.0;
+        assert!(matches!(
+            record_completed_run(continuous_provenance(), inconsistent),
             Err(RunRecordError::InvalidResult(_))
         ));
     }

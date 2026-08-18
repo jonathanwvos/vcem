@@ -1,6 +1,13 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{fmt, mem::size_of, sync::Arc};
+use std::{
+    fmt,
+    mem::size_of,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crate::quantization::IntensityCalibration;
 
@@ -429,6 +436,7 @@ pub enum ContinuousAutomataError {
     InvalidConvergenceTolerance {
         value: f32,
     },
+    Cancelled,
     InvalidDimensions {
         width: usize,
         height: usize,
@@ -541,6 +549,7 @@ impl fmt::Display for ContinuousAutomataError {
                 formatter,
                 "Continuous convergence tolerance must be finite and non-negative; found {value}."
             ),
+            Self::Cancelled => formatter.write_str("Continuous automata run was cancelled."),
             Self::InvalidDimensions { width, height } => write!(
                 formatter,
                 "Continuous automata require non-zero addressable dimensions; found {width} x {height}."
@@ -582,6 +591,31 @@ pub fn compile_continuous_lenia(
     mut program: ContinuousLeniaProgram,
     limits: ContinuousCompileLimits,
 ) -> Result<CompiledContinuousLenia, ContinuousAutomataError> {
+    validate_continuous_lenia_program(&program, limits)?;
+    let kernel_width = program.kernel.width as usize;
+    let kernel_height = program.kernel.height as usize;
+    normalize_kernel(&mut program.kernel.weights, program.kernel_normalization)?;
+
+    Ok(CompiledContinuousLenia {
+        domain: program.domain,
+        kernel_width,
+        kernel_height,
+        anchor_x: program.kernel.anchor_x as usize,
+        anchor_y: program.kernel.anchor_y as usize,
+        kernel_weights: Arc::new(program.kernel.weights),
+        kernel_normalization: program.kernel_normalization,
+        boundary: program.boundary,
+        growth: program.growth,
+        time_step: program.time_step,
+    })
+}
+
+/// Validates a serialized continuous program without cloning or consuming its
+/// dense kernel. Persistence code uses this before binding a result record.
+pub fn validate_continuous_lenia_program(
+    program: &ContinuousLeniaProgram,
+    limits: ContinuousCompileLimits,
+) -> Result<(), ContinuousAutomataError> {
     if program.version != CONTINUOUS_LENIA_PROGRAM_VERSION {
         return Err(ContinuousAutomataError::UnsupportedProgramVersion {
             found: program.version,
@@ -644,20 +678,8 @@ pub fn compile_continuous_lenia(
         return Err(ContinuousAutomataError::NonFiniteKernelWeight { index });
     }
 
-    normalize_kernel(&mut program.kernel.weights, program.kernel_normalization)?;
-
-    Ok(CompiledContinuousLenia {
-        domain: program.domain,
-        kernel_width,
-        kernel_height,
-        anchor_x: program.kernel.anchor_x as usize,
-        anchor_y: program.kernel.anchor_y as usize,
-        kernel_weights: Arc::new(program.kernel.weights),
-        kernel_normalization: program.kernel_normalization,
-        boundary: program.boundary,
-        growth: program.growth,
-        time_step: program.time_step,
-    })
+    validate_kernel_normalization(&program.kernel.weights, program.kernel_normalization)?;
+    Ok(())
 }
 
 pub fn run_continuous_lenia(
@@ -666,6 +688,35 @@ pub fn run_continuous_lenia(
     width: usize,
     height: usize,
     config: &ContinuousRunConfig,
+) -> Result<ContinuousSimulationResult, ContinuousAutomataError> {
+    run_continuous_lenia_inner(program, initial_state, width, height, config, None)
+}
+
+pub fn run_continuous_lenia_with_cancellation(
+    program: &CompiledContinuousLenia,
+    initial_state: &[f32],
+    width: usize,
+    height: usize,
+    config: &ContinuousRunConfig,
+    cancellation: &AtomicBool,
+) -> Result<ContinuousSimulationResult, ContinuousAutomataError> {
+    run_continuous_lenia_inner(
+        program,
+        initial_state,
+        width,
+        height,
+        config,
+        Some(cancellation),
+    )
+}
+
+fn run_continuous_lenia_inner(
+    program: &CompiledContinuousLenia,
+    initial_state: &[f32],
+    width: usize,
+    height: usize,
+    config: &ContinuousRunConfig,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<ContinuousSimulationResult, ContinuousAutomataError> {
     if config.version != CONTINUOUS_RUN_CONFIG_VERSION {
         return Err(ContinuousAutomataError::UnsupportedRunConfigVersion {
@@ -722,6 +773,9 @@ pub fn run_continuous_lenia(
     let mut last_transition_max_delta = None;
 
     for generation in 0..config.cycles {
+        if cancellation.is_some_and(|token| token.load(Ordering::Relaxed)) {
+            return Err(ContinuousAutomataError::Cancelled);
+        }
         let maximum_delta = step_continuous(program, &state, &mut next, width, height);
         transition_steps_executed += 1;
         last_transition_max_delta = Some(maximum_delta);
@@ -768,6 +822,26 @@ fn normalize_kernel(
     for (index, weight) in weights.iter_mut().enumerate() {
         *weight = (*weight as f64 / divisor) as f32;
         if !weight.is_finite() {
+            return Err(ContinuousAutomataError::InvalidNormalizedKernelWeight { index });
+        }
+    }
+    Ok(())
+}
+
+fn validate_kernel_normalization(
+    weights: &[f32],
+    normalization: KernelNormalization,
+) -> Result<(), ContinuousAutomataError> {
+    let divisor: f64 = match normalization {
+        KernelNormalization::None => return Ok(()),
+        KernelNormalization::SumToOne => weights.iter().map(|weight| *weight as f64).sum(),
+        KernelNormalization::L1ToOne => weights.iter().map(|weight| weight.abs() as f64).sum(),
+    };
+    if divisor == 0.0 {
+        return Err(ContinuousAutomataError::ZeroKernelNormalization { normalization });
+    }
+    for (index, weight) in weights.iter().enumerate() {
+        if !(*weight as f64 / divisor).is_finite() {
             return Err(ContinuousAutomataError::InvalidNormalizedKernelWeight { index });
         }
     }
