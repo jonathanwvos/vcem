@@ -14,7 +14,7 @@ use std::{
     thread,
 };
 
-use crate::analysis::{intensity_histogram_from_path, processed_image_from_path};
+use crate::analysis::processed_image_from_path;
 use crate::types::{
     CellularAutomataResponse, CellularAutomataSeedMode, CellularAutomataSettings, DenoiseMethod,
     DenoiseSettings, DisplayedImage, ExperimentConfiguration, ImageFile, ImageRotation,
@@ -36,7 +36,7 @@ pub struct VCEMApp {
     viewer_pan: Vec2,
     viewer_needs_fit: bool,
     picker_drag_selection: Option<bool>,
-    histogram_bin_count: usize,
+    histogram_bin_count: HistogramBinCountControl,
     histogram: Option<IntensityHistogram>,
     histogram_error: Option<String>,
     reset_histogram_view: bool,
@@ -134,6 +134,38 @@ enum ViewMode {
     Measure,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistogramBinCountControl {
+    applied: usize,
+    draft: usize,
+}
+
+impl HistogramBinCountControl {
+    fn new(value: usize) -> Self {
+        Self {
+            applied: value,
+            draft: value,
+        }
+    }
+
+    fn applied(self) -> usize {
+        self.applied
+    }
+
+    fn draft_mut(&mut self) -> &mut usize {
+        &mut self.draft
+    }
+
+    fn commit(&mut self) {
+        self.applied = self.draft;
+    }
+
+    fn set(&mut self, value: usize) {
+        self.applied = value;
+        self.draft = value;
+    }
+}
+
 impl VCEMApp {
     pub fn new(_: &CreationContext<'_>) -> Self {
         let current_dir = std::env::current_dir().unwrap_or_default();
@@ -158,7 +190,7 @@ impl VCEMApp {
             viewer_pan: Vec2::ZERO,
             viewer_needs_fit: true,
             picker_drag_selection: None,
-            histogram_bin_count: 256,
+            histogram_bin_count: HistogramBinCountControl::new(256),
             histogram: None,
             histogram_error: None,
             reset_histogram_view: false,
@@ -381,20 +413,13 @@ impl VCEMApp {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("Bin count");
-                            let response = ui.add(
-                                DragValue::new(&mut self.histogram_bin_count)
+                            ui.add_enabled(
+                                !is_processing,
+                                DragValue::new(self.histogram_bin_count.draft_mut())
                                     .range(2..=4096)
                                     .speed(1),
                             )
                             .on_hover_text("Controls how finely intensities are divided into bins.");
-                            if response.changed() {
-                                self.displayed_image = None;
-                                self.histogram = None;
-                                self.histogram_error = None;
-                                self.clear_histogram_highlight();
-                                self.processing_job = None;
-                                self.reset_histogram_view = true;
-                            }
                         });
 
                         if ui
@@ -402,7 +427,7 @@ impl VCEMApp {
                             .on_hover_text("Builds the intensity distribution for the current processed image.")
                             .clicked()
                         {
-                            self.create_intensity_histogram();
+                            self.create_intensity_histogram(ui.ctx());
                         }
 
                         if let Some(error) = &self.histogram_error {
@@ -1509,49 +1534,29 @@ impl VCEMApp {
         }
     }
 
-    fn create_intensity_histogram(&mut self) {
+    fn create_intensity_histogram(&mut self, ctx: &egui::Context) {
+        self.histogram_bin_count.commit();
         self.histogram = None;
         self.histogram_error = None;
+        self.reset_histogram_view = true;
+        self.clear_histogram_highlight();
 
-        let Some(path) = self
-            .selected_image
-            .and_then(|index| self.images.get(index))
-            .map(|image| image.path.clone())
-        else {
+        let Some((image_index, path, name)) = self.selected_image.and_then(|index| {
+            self.images
+                .get(index)
+                .map(|image| (index, image.path.clone(), image.name.clone()))
+        }) else {
             self.histogram_error = Some("Select an image before creating a histogram.".to_owned());
             return;
         };
 
-        if self.applied_rotation != ImageRotation::None
-            || self.applied_denoise.is_some()
-            || self.applied_invert
-            || self.applied_equalization.is_some()
-            || self.applied_gamma.is_some()
-        {
-            let mut configuration = self.applied_experiment_configuration();
-            configuration.cellular_automata = None;
-            match processed_image_from_path(&path, &configuration) {
-                Ok(processed) => {
-                    self.histogram = Some(processed.histogram);
-                    self.reset_histogram_view = true;
-                }
-                Err(error) => {
-                    self.histogram_error = Some(error);
-                    self.reset_histogram_view = true;
-                }
-            }
-        } else {
-            match intensity_histogram_from_path(&path, self.histogram_bin_count) {
-                Ok(histogram) => {
-                    self.histogram = Some(histogram);
-                    self.reset_histogram_view = true;
-                }
-                Err(error) => {
-                    self.histogram_error = Some(error);
-                    self.reset_histogram_view = true;
-                }
-            }
-        }
+        self.start_processing_job(
+            ctx,
+            image_index,
+            path,
+            name,
+            ProcessingKind::Preview(self.applied_experiment_configuration()),
+        );
     }
 
     fn current_denoise_settings(&self) -> Option<DenoiseSettings> {
@@ -1564,7 +1569,7 @@ impl VCEMApp {
     fn applied_experiment_configuration(&self) -> ExperimentConfiguration {
         ExperimentConfiguration {
             schema_version: 1,
-            histogram_bin_count: self.histogram_bin_count,
+            histogram_bin_count: self.histogram_bin_count.applied(),
             rotation: self.applied_rotation,
             denoise: self.applied_denoise,
             invert: self.applied_invert,
@@ -1825,7 +1830,8 @@ impl VCEMApp {
     }
 
     fn sync_controls_from_configuration(&mut self, configuration: &ExperimentConfiguration) {
-        self.histogram_bin_count = configuration.histogram_bin_count;
+        self.histogram_bin_count
+            .set(configuration.histogram_bin_count);
         self.reset_cellular_response_view = true;
         self.rotation = configuration.rotation;
         self.denoise_method = configuration
@@ -1941,6 +1947,7 @@ impl VCEMApp {
                 let bin_indices = processed.bin_indices;
                 let bin_count = processed.bin_count;
                 let cellular_automata_summary = processed.cellular_automata_summary;
+                let cellular_automata_result = processed.cellular_automata_result;
                 let cellular_automata_texture =
                     processed.cellular_automata_overlay.map(|overlay| {
                         ctx.load_texture(
@@ -1962,6 +1969,7 @@ impl VCEMApp {
                     highlight_texture: None,
                     cellular_automata_texture,
                     cellular_automata_summary,
+                    cellular_automata_result,
                 });
                 if self
                     .selected_histogram_bins
@@ -2276,7 +2284,7 @@ impl ProcessingKind {
 
 impl ExperimentConfiguration {
     fn apply_as_current(self, app: &mut VCEMApp) {
-        app.histogram_bin_count = self.histogram_bin_count;
+        app.histogram_bin_count.set(self.histogram_bin_count);
         app.applied_rotation = self.rotation;
         app.rotation = self.rotation;
         app.applied_denoise = self.denoise;
@@ -2651,7 +2659,9 @@ impl DisplayedImage {
             .floor()
             .clamp(0.0, (height - 1) as f32) as usize;
 
-        self.bin_indices.get(y * width + x).copied()
+        self.bin_indices
+            .get(y * width + x)
+            .and_then(|bin| usize::try_from(*bin).ok())
     }
 
     fn bins_in_pointer_rect(&self, image_rect: Rect, selection_rect: Rect) -> BTreeSet<usize> {
@@ -2684,8 +2694,10 @@ impl DisplayedImage {
         for y in min_y.min(max_y)..=min_y.max(max_y) {
             let row_start = y * width;
             for x in min_x.min(max_x)..=min_x.max(max_x) {
-                if let Some(bin) = self.bin_indices.get(row_start + x) {
-                    bins.insert(*bin);
+                if let Some(bin) = self.bin_indices.get(row_start + x)
+                    && let Ok(bin) = usize::try_from(*bin)
+                {
+                    bins.insert(bin);
                 }
             }
         }
@@ -2694,10 +2706,10 @@ impl DisplayedImage {
     }
 }
 
-fn histogram_highlight_rgba(bin_indices: &[usize], highlighted_bins: &BTreeSet<usize>) -> Vec<u8> {
+fn histogram_highlight_rgba(bin_indices: &[u32], highlighted_bins: &BTreeSet<usize>) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(bin_indices.len() * 4);
     for bin in bin_indices {
-        if highlighted_bins.contains(bin) {
+        if usize::try_from(*bin).is_ok_and(|bin| highlighted_bins.contains(&bin)) {
             rgba.extend_from_slice(&[255, 184, 54, 128]);
         } else {
             rgba.extend_from_slice(&[0, 0, 0, 0]);
@@ -2730,7 +2742,25 @@ impl App for VCEMApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{CellularKernelBrush, toggle_kernel_weight, toggled_kernel_brush};
+    use super::{
+        CellularKernelBrush, HistogramBinCountControl, toggle_kernel_weight, toggled_kernel_brush,
+    };
+
+    #[test]
+    fn histogram_bin_count_is_staged_until_committed() {
+        let mut control = HistogramBinCountControl::new(256);
+
+        *control.draft_mut() = 4096;
+        assert_eq!(control.applied(), 256);
+
+        control.commit();
+        assert_eq!(control.applied(), 4096);
+
+        *control.draft_mut() = 128;
+        control.set(512);
+        assert_eq!(control.applied(), 512);
+        assert_eq!(*control.draft_mut(), 512);
+    }
 
     #[test]
     fn selected_kernel_sign_toggles_off_and_back_on() {

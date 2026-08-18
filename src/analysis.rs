@@ -2,15 +2,18 @@ use std::{fs::File, io::BufReader, path::Path};
 
 use eframe::egui::{ColorImage, Vec2};
 use image::{DynamicImage, imageops::FilterType};
-use rayon::prelude::*;
 use tiff::{
     ColorType,
     decoder::{Decoder, DecodingResult},
 };
 
+use crate::automata::{CellularAutomataResult, simulate_legacy};
+use crate::quantization::{
+    CompiledHistogramStateInitializer, HistogramStateInitializer, IntensityCalibration,
+    QuantizedHistogram, QuantizedIntensities,
+};
 use crate::types::{
-    CellularAutomataResponse, CellularAutomataSeedMode, CellularAutomataSettings,
-    CellularAutomataSummary, DenoiseMethod, DenoiseSettings, ExperimentConfiguration,
+    CellularAutomataSettings, DenoiseMethod, DenoiseSettings, ExperimentConfiguration,
     ImageRotation, IntensityHistogram, ProcessedImage,
 };
 
@@ -21,12 +24,9 @@ pub fn intensity_histogram_from_path(
     bin_count: usize,
 ) -> std::result::Result<IntensityHistogram, String> {
     let plane = decode_gray_plane(path)?;
-    Ok(histogram_from_values(
-        plane.values.iter().copied(),
-        bin_count.clamp(2, 4096),
-        plane.value_range,
-        &plane.source_description,
-    ))
+    let quantizer = compile_normal_histogram_quantizer(plane.calibration, bin_count)?;
+    let histogram = quantizer.histogram(&plane.values)?;
+    Ok(histogram_from_counts(histogram, &plane.source_description))
 }
 
 pub fn gamma_adjusted_image_from_path(
@@ -47,6 +47,12 @@ pub fn processed_image_from_path(
     configuration: &ExperimentConfiguration,
 ) -> std::result::Result<ProcessedImage, String> {
     let mut plane = decode_gray_plane(path)?;
+    if plane.calibration.minimum != 0 {
+        return Err(
+            "The current image-processing pipeline requires zero-based encoded intensities."
+                .to_owned(),
+        );
+    }
     let mut description = plane.source_description.clone();
 
     if configuration.rotation != ImageRotation::None {
@@ -67,7 +73,7 @@ pub fn processed_image_from_path(
     }
 
     if configuration.invert {
-        invert_values(&mut plane.values, plane.max_value);
+        invert_values(&mut plane.values, plane.calibration.maximum_value());
         description = format!("{} + inverted values", description);
     }
 
@@ -76,8 +82,8 @@ pub fn processed_image_from_path(
         if strength > 0.0 {
             equalize_histogram_values(
                 &mut plane.values,
-                plane.max_value,
-                plane.value_range,
+                plane.calibration.maximum_value(),
+                plane.calibration.level_count(),
                 strength,
             );
             description = format!("{} + equalized {:.0}%", description, strength * 100.0);
@@ -86,7 +92,7 @@ pub fn processed_image_from_path(
 
     if let Some(gamma) = configuration.gamma {
         let gamma = gamma.clamp(0.001, 4.0);
-        apply_gamma_values(&mut plane.values, plane.max_value, gamma);
+        apply_gamma_values(&mut plane.values, plane.calibration.maximum_value(), gamma);
         description = format!("{} + gamma {:.3}", description, gamma);
     }
 
@@ -98,19 +104,22 @@ pub fn processed_image_from_path(
         })
         .transpose()?;
 
-    Ok(process_values(
-        plane
-            .values
-            .iter()
-            .copied()
-            .zip(plane.alpha.iter().copied()),
+    // Keep the per-pixel bin buffer out of the legacy CA's peak working set.
+    // New discrete models will consume these exact identifiers as generation
+    // zero instead of allocating a second quantized image.
+    let quantizer =
+        compile_normal_histogram_quantizer(plane.calibration, configuration.histogram_bin_count)?;
+    let quantized = quantizer.quantize(&plane.values)?;
+
+    process_values(
+        &plane.values,
+        &plane.alpha,
         [plane.width, plane.height],
-        configuration.histogram_bin_count.clamp(2, 4096),
-        plane.value_range,
-        plane.max_value,
+        plane.calibration.maximum_value(),
         &description,
+        quantized,
         cellular_automata,
-    ))
+    )
 }
 
 struct GrayPlane {
@@ -118,8 +127,7 @@ struct GrayPlane {
     height: usize,
     values: Vec<u32>,
     alpha: Vec<u8>,
-    value_range: u64,
-    max_value: u32,
+    calibration: IntensityCalibration,
     source_description: String,
 }
 
@@ -195,8 +203,8 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
                 height,
                 values: image.pixels().map(|pixel| pixel.0[0] as u32).collect(),
                 alpha: vec![255; width * height],
-                value_range: 256,
-                max_value: 255,
+                calibration: IntensityCalibration::full_scale(256)
+                    .expect("8-bit calibration is valid"),
                 source_description: preview_description(
                     "8-bit grayscale",
                     source_width,
@@ -229,8 +237,8 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
                 height,
                 values,
                 alpha,
-                value_range: 256,
-                max_value: 255,
+                calibration: IntensityCalibration::full_scale(256)
+                    .expect("8-bit calibration is valid"),
                 source_description: preview_description(
                     "8-bit grayscale + alpha",
                     source_width,
@@ -257,8 +265,8 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
                 height,
                 values: image.pixels().map(|pixel| pixel.0[0] as u32).collect(),
                 alpha: vec![255; width * height],
-                value_range: 65_536,
-                max_value: 65_535,
+                calibration: IntensityCalibration::full_scale(65_536)
+                    .expect("16-bit calibration is valid"),
                 source_description: preview_description(
                     "16-bit grayscale",
                     source_width,
@@ -291,8 +299,8 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
                 height,
                 values,
                 alpha,
-                value_range: 65_536,
-                max_value: 65_535,
+                calibration: IntensityCalibration::full_scale(65_536)
+                    .expect("16-bit calibration is valid"),
                 source_description: preview_description(
                     "16-bit grayscale + alpha",
                     source_width,
@@ -320,8 +328,8 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
                 height,
                 values: image.pixels().map(|pixel| pixel.0[0] as u32).collect(),
                 alpha: vec![255; width * height],
-                value_range: 65_536,
-                max_value: 65_535,
+                calibration: IntensityCalibration::full_scale(65_536)
+                    .expect("16-bit calibration is valid"),
                 source_description: preview_description(
                     "converted to 16-bit grayscale",
                     source_width,
@@ -428,8 +436,7 @@ fn float_values_to_gray_plane(
         height,
         values: normalized_values,
         alpha: vec![255; width * height],
-        value_range: 65_536,
-        max_value: 65_535,
+        calibration: IntensityCalibration::full_scale(65_536).expect("16-bit calibration is valid"),
         source_description: format!(
             "{} normalized {:.3}..{:.3}",
             preview_description(
@@ -695,309 +702,116 @@ fn cellular_automata_overlay(
     width: usize,
     height: usize,
     settings: &CellularAutomataSettings,
-) -> std::result::Result<(ColorImage, CellularAutomataSummary), String> {
-    let (state, summary) = evolve_cellular_automata(values, width, height, settings)?;
-    let mut rgba = Vec::with_capacity(state.len() * 4);
+) -> std::result::Result<(ColorImage, CellularAutomataResult), String> {
+    let result = simulate_legacy(values, width, height, settings)?;
+    let mut rgba = Vec::with_capacity(result.state.len() * 4);
 
-    for activation in state {
+    for activation in &result.state {
         let alpha = (activation.sqrt() * 190.0).round().clamp(0.0, 190.0) as u8;
         rgba.extend_from_slice(&[30, 210, 190, alpha]);
     }
 
     Ok((
         ColorImage::from_rgba_unmultiplied([width, height], &rgba),
-        summary,
+        result,
     ))
 }
 
-fn evolve_cellular_automata(
-    values: &[u32],
-    width: usize,
-    height: usize,
-    settings: &CellularAutomataSettings,
-) -> std::result::Result<(Vec<f32>, CellularAutomataSummary), String> {
-    if width == 0 || height == 0 || values.len() != width * height {
-        return Err("Cellular automata requires a non-empty rectangular image.".to_owned());
-    }
-
-    let kernels = compile_cellular_kernels(settings)?;
-
-    let min_value = values.iter().copied().min().unwrap_or(0);
-    let max_value = values.iter().copied().max().unwrap_or(min_value);
-    let observed_range = max_value.saturating_sub(min_value) as f32;
-    let mut evidence = if observed_range <= f32::EPSILON {
-        vec![0.0; values.len()]
-    } else {
-        values
-            .iter()
-            .map(|value| (value.saturating_sub(min_value) as f32 / observed_range).clamp(0.0, 1.0))
-            .collect::<Vec<_>>()
-    };
-    if observed_range > f32::EPSILON && settings.seed_mode == CellularAutomataSeedMode::Dark {
-        for value in &mut evidence {
-            *value = 1.0 - *value;
-        }
-    }
-
-    let mut state = evidence.clone();
-    let mut next_state = vec![0.0_f32; state.len()];
-    let time_step = settings.time_step.clamp(0.001, 1.0);
-    let growth_rate = settings.growth_rate.clamp(0.0, 4.0);
-    let decay_rate = settings.decay_rate.clamp(0.0, 4.0);
-    let iterations = settings.iterations.clamp(1, 512);
-    let mut iterations_run = 0;
-    let mut converged = false;
-
-    for iteration in 0..iterations {
-        let max_change = next_state
-            .par_chunks_mut(width)
-            .enumerate()
-            .map(|(y, row)| {
-                let mut row_max_change = 0.0_f32;
-                for (x, output) in row.iter_mut().enumerate() {
-                    let index = y * width + x;
-                    let mut response = f32::NEG_INFINITY;
-
-                    for kernel in &kernels {
-                        let mut sensed = 0.0_f32;
-                        for sample in kernel {
-                            let sample_x = reflect_coordinate(x as isize + sample.offset_x, width);
-                            let sample_y = reflect_coordinate(y as isize + sample.offset_y, height);
-                            sensed += state[sample_y * width + sample_x] * sample.weight;
-                        }
-                        response = response.max(cellular_growth_response(sensed, settings));
-                    }
-
-                    let evidence_gated_response = if response > 0.0 {
-                        response * evidence[index]
-                    } else {
-                        response
-                    };
-                    let change = time_step
-                        * (growth_rate * evidence_gated_response - decay_rate * state[index]);
-                    let updated = (state[index] + change).clamp(0.0, 1.0);
-                    row_max_change = row_max_change.max((updated - state[index]).abs());
-                    *output = updated;
-                }
-                row_max_change
-            })
-            .reduce(|| 0.0, f32::max);
-
-        std::mem::swap(&mut state, &mut next_state);
-        iterations_run = iteration + 1;
-        if max_change < 0.0001 {
-            converged = true;
-            break;
-        }
-    }
-
-    let mean_activation = state.iter().sum::<f32>() / state.len() as f32;
-    let active_fraction = state
-        .iter()
-        .filter(|activation| **activation >= 0.1)
-        .count() as f32
-        / state.len() as f32;
-
-    Ok((
-        state,
-        CellularAutomataSummary {
-            iterations_run,
-            converged,
-            mean_activation,
-            active_fraction,
-        },
-    ))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct CellularKernelSample {
-    offset_x: isize,
-    offset_y: isize,
-    weight: f32,
-}
-
-fn compile_cellular_kernels(
-    settings: &CellularAutomataSettings,
-) -> std::result::Result<Vec<Vec<CellularKernelSample>>, String> {
-    let kernel_size = settings.kernel_size;
-    if kernel_size < 3
-        || kernel_size.is_multiple_of(2)
-        || settings.kernel.len() != kernel_size * kernel_size
-    {
-        return Err("Cellular automata kernel must be an odd square of at least 3 x 3.".to_owned());
-    }
-
-    let kernel_radius = (kernel_size / 2) as isize;
-    let kernel_scale: f32 = settings.kernel.iter().map(|weight| weight.abs()).sum();
-    if kernel_scale <= f32::EPSILON {
-        return Err("Cellular automata kernel must contain at least one non-zero cell.".to_owned());
-    }
-
-    let base_samples = settings
-        .kernel
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|(_, weight)| weight.abs() > f32::EPSILON)
-        .map(|(index, weight)| {
-            let x = (index % kernel_size) as isize - kernel_radius;
-            let y = (index / kernel_size) as isize - kernel_radius;
-            (x, y, weight / kernel_scale)
-        })
-        .collect::<Vec<_>>();
-    let turns = if settings.omni_directional { 4 } else { 1 };
-    let mut kernels = Vec::with_capacity(turns);
-
-    for turn in 0..turns {
-        let mut rotated = base_samples
-            .iter()
-            .map(|(offset_x, offset_y, weight)| {
-                let (offset_x, offset_y) = rotate_kernel_offset(*offset_x, *offset_y, turn);
-                CellularKernelSample {
-                    offset_x,
-                    offset_y,
-                    weight: *weight,
-                }
-            })
-            .collect::<Vec<_>>();
-        rotated.sort_by_key(|sample| (sample.offset_y, sample.offset_x));
-        if !kernels.contains(&rotated) {
-            kernels.push(rotated);
-        }
-    }
-
-    Ok(kernels)
-}
-
-fn rotate_kernel_offset(x: isize, y: isize, turn: usize) -> (isize, isize) {
-    match turn % 4 {
-        0 => (x, y),
-        1 => (-y, x),
-        2 => (-x, -y),
-        _ => (y, -x),
-    }
-}
-
-fn cellular_growth_response(sensed: f32, settings: &CellularAutomataSettings) -> f32 {
-    let center = settings.response_center.clamp(-1.0, 1.0);
-    let width = settings.response_width.clamp(0.001, 2.0);
-
-    match settings.response {
-        CellularAutomataResponse::Gaussian => {
-            let distance = (sensed - center) / width;
-            2.0 * (-0.5 * distance * distance).exp() - 1.0
-        }
-        CellularAutomataResponse::Band => {
-            let edge_distance = width - (sensed - center).abs();
-            (edge_distance / (width * 0.15).max(0.005)).tanh()
-        }
-        CellularAutomataResponse::Threshold => ((sensed - center) / width.max(0.005)).tanh(),
-        CellularAutomataResponse::LowThreshold => ((center - sensed) / width.max(0.005)).tanh(),
-    }
-}
-
-fn reflect_coordinate(coordinate: isize, length: usize) -> usize {
-    if length <= 1 {
-        return 0;
-    }
-
-    let period = 2 * (length as isize - 1);
-    let wrapped = coordinate.rem_euclid(period);
-    if wrapped < length as isize {
-        wrapped as usize
-    } else {
-        (period - wrapped) as usize
-    }
-}
-
-fn histogram_from_values(
-    values: impl Iterator<Item = u32>,
+fn compile_normal_histogram_quantizer(
+    calibration: IntensityCalibration,
     bin_count: usize,
-    value_range: u64,
+) -> Result<CompiledHistogramStateInitializer, String> {
+    if !(2..=4096).contains(&bin_count) {
+        return Err("Histogram bin count must be between 2 and 4096.".to_owned());
+    }
+    let bin_count = u32::try_from(bin_count)
+        .map_err(|_| "Histogram bin count cannot be represented as u32.".to_owned())?;
+    HistogramStateInitializer::identity(calibration, bin_count).compile()
+}
+
+fn histogram_from_counts(
+    histogram: QuantizedHistogram,
     source_description: &str,
 ) -> IntensityHistogram {
-    let mut min_value = u32::MAX;
-    let mut max_value = u32::MIN;
-    let mut pixel_count = 0;
-    let mut bins = vec![0; bin_count];
-
-    for value in values {
-        min_value = min_value.min(value);
-        max_value = max_value.max(value);
-        pixel_count += 1;
-
-        let bin = (value as u64 * bin_count as u64 / value_range).min(bin_count as u64 - 1);
-        bins[bin as usize] += 1;
-    }
-
-    if pixel_count == 0 {
-        min_value = 0;
-        max_value = 0;
-    }
+    let (min_value, max_value) = histogram.observed_range.unwrap_or((0, 0));
 
     IntensityHistogram {
-        bins,
+        bins: histogram.counts,
         min_value,
         max_value,
-        pixel_count,
+        pixel_count: histogram.pixel_count,
+        calibration: histogram.calibration,
         source_description: source_description.to_owned(),
     }
 }
 
 fn process_values(
-    values: impl Iterator<Item = (u32, u8)>,
+    values: &[u32],
+    alpha: &[u8],
     size: [usize; 2],
-    bin_count: usize,
-    value_range: u64,
     display_max: u32,
     source_description: &str,
-    cellular_automata: Option<(ColorImage, CellularAutomataSummary)>,
-) -> ProcessedImage {
-    let mut min_value = u32::MAX;
-    let mut max_value = u32::MIN;
-    let mut pixel_count = 0;
-    let mut bins = vec![0; bin_count];
-    let mut bin_indices = Vec::with_capacity(size[0] * size[1]);
-    let mut rgba = Vec::with_capacity(size[0] * size[1] * 4);
-
-    for (value, alpha) in values {
-        min_value = min_value.min(value);
-        max_value = max_value.max(value);
-        pixel_count += 1;
-
-        let bin = (value as u64 * bin_count as u64 / value_range).min(bin_count as u64 - 1);
-        let bin = bin as usize;
-        bins[bin] += 1;
-        bin_indices.push(bin);
-
-        let display_value = (value * 255 / display_max.max(1)) as u8;
-        rgba.extend_from_slice(&[display_value, display_value, display_value, alpha]);
+    quantized: QuantizedIntensities,
+    cellular_automata: Option<(ColorImage, CellularAutomataResult)>,
+) -> Result<ProcessedImage, String> {
+    let pixel_count = size[0]
+        .checked_mul(size[1])
+        .ok_or_else(|| "Processed image dimensions overflowed usize.".to_owned())?;
+    if values.len() != pixel_count
+        || alpha.len() != pixel_count
+        || quantized.bin_indices.len() != pixel_count
+    {
+        return Err(
+            "Processed image values, alpha, and histogram bins must match its dimensions."
+                .to_owned(),
+        );
     }
 
-    if pixel_count == 0 {
-        min_value = 0;
-        max_value = 0;
+    let rgba_len = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| "Processed image RGBA allocation size overflowed usize.".to_owned())?;
+    let mut rgba = Vec::new();
+    rgba.try_reserve_exact(rgba_len)
+        .map_err(|_| "Could not allocate the processed image RGBA buffer.".to_owned())?;
+    for (value, alpha) in values.iter().zip(alpha) {
+        let display_value = (*value as u64 * 255 / display_max.max(1) as u64).min(255) as u8;
+        rgba.extend_from_slice(&[display_value, display_value, display_value, *alpha]);
     }
 
-    let (cellular_automata_overlay, cellular_automata_summary) = cellular_automata
-        .map(|(overlay, summary)| (Some(overlay), Some(summary)))
-        .unwrap_or((None, None));
+    let QuantizedIntensities {
+        bin_indices,
+        counts,
+        observed_range,
+        calibration,
+        bin_count,
+    } = quantized;
+    let bin_count = usize::try_from(bin_count)
+        .map_err(|_| "Histogram bin count is not addressable on this platform.".to_owned())?;
+    let (min_value, max_value) = observed_range.unwrap_or((0, 0));
+    let histogram = IntensityHistogram {
+        bins: counts,
+        min_value,
+        max_value,
+        pixel_count: bin_indices.len() as u64,
+        calibration,
+        source_description: source_description.to_owned(),
+    };
 
-    ProcessedImage {
+    let (cellular_automata_overlay, cellular_automata_summary, cellular_automata_result) =
+        cellular_automata
+            .map(|(overlay, result)| (Some(overlay), Some(result.summary), Some(result)))
+            .unwrap_or((None, None, None));
+
+    Ok(ProcessedImage {
         size: Vec2::new(size[0] as f32, size[1] as f32),
         color_image: ColorImage::from_rgba_unmultiplied(size, &rgba),
-        histogram: IntensityHistogram {
-            bins,
-            min_value,
-            max_value,
-            pixel_count,
-            source_description: source_description.to_owned(),
-        },
+        histogram,
         bin_indices,
         bin_count,
         cellular_automata_overlay,
         cellular_automata_summary,
-    }
+        cellular_automata_result,
+    })
 }
 
 impl DenoiseSettings {
@@ -1033,103 +847,33 @@ mod tests {
     }
 
     #[test]
-    fn cellular_automata_extinguishes_unsupported_activation() {
+    fn processed_image_retains_numeric_cellular_automata_result() {
         let values = vec![0, 32, 64, 96, 128, 160, 192, 224, 255];
-        let settings = CellularAutomataSettings {
-            kernel_size: 3,
-            kernel: vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-            seed_mode: CellularAutomataSeedMode::Bright,
-            response: CellularAutomataResponse::Gaussian,
-            response_center: -1.0,
-            response_width: 0.01,
-            decay_rate: 0.25,
-            time_step: 0.2,
-            iterations: 5,
-            ..CellularAutomataSettings::default()
-        };
+        let (overlay, result) =
+            cellular_automata_overlay(&values, 3, 3, &CellularAutomataSettings::default()).unwrap();
+        let expected_state = result.state.clone();
+        let expected_summary = result.summary;
 
-        let (state, summary) = evolve_cellular_automata(&values, 3, 3, &settings).unwrap();
+        let quantizer =
+            compile_normal_histogram_quantizer(IntensityCalibration::full_scale(256).unwrap(), 256)
+                .unwrap();
+        let quantized = quantizer.quantize(&values).unwrap();
+        let processed = process_values(
+            &values,
+            &[255; 9],
+            [3, 3],
+            255,
+            "test",
+            quantized,
+            Some((overlay, result)),
+        )
+        .unwrap();
 
-        assert!(state.iter().sum::<f32>() / (state.len() as f32) < 0.1);
-        assert_eq!(summary.iterations_run, 5);
-        assert!(summary.active_fraction < 0.2);
-    }
-
-    #[test]
-    fn cellular_automata_preserves_supported_activation() {
-        let values = vec![0, 0, 0, 0, 255, 0, 0, 0, 0];
-        let settings = CellularAutomataSettings {
-            kernel_size: 3,
-            kernel: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
-            seed_mode: CellularAutomataSeedMode::Bright,
-            response: CellularAutomataResponse::Threshold,
-            response_center: 0.2,
-            response_width: 0.01,
-            decay_rate: 0.0,
-            time_step: 0.1,
-            iterations: 4,
-            ..CellularAutomataSettings::default()
-        };
-
-        let (state, _) = evolve_cellular_automata(&values, 3, 3, &settings).unwrap();
-
-        assert!(state[4] > 0.9);
-        assert!(
-            state
-                .iter()
-                .enumerate()
-                .all(|(index, value)| index == 4 || *value < 0.01)
-        );
-    }
-
-    #[test]
-    fn low_pass_threshold_inverts_high_pass_threshold_response() {
-        let high_pass = CellularAutomataSettings {
-            response: CellularAutomataResponse::Threshold,
-            response_center: 0.2,
-            response_width: 0.05,
-            ..CellularAutomataSettings::default()
-        };
-        let low_pass = CellularAutomataSettings {
-            response: CellularAutomataResponse::LowThreshold,
-            ..high_pass.clone()
-        };
-
-        assert!(cellular_growth_response(0.0, &high_pass) < 0.0);
-        assert!(cellular_growth_response(0.0, &low_pass) > 0.0);
-        assert!(cellular_growth_response(0.4, &high_pass) > 0.0);
-        assert!(cellular_growth_response(0.4, &low_pass) < 0.0);
-    }
-
-    #[test]
-    fn omni_directional_kernel_passes_collapse_by_cardinal_symmetry() {
-        let mut disk = CellularAutomataSettings {
-            kernel_size: 3,
-            kernel: vec![0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0],
-            omni_directional: true,
-            ..CellularAutomataSettings::default()
-        };
-        assert_eq!(compile_cellular_kernels(&disk).unwrap().len(), 1);
-
-        disk.kernel = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
-        assert_eq!(compile_cellular_kernels(&disk).unwrap().len(), 2);
-
-        disk.kernel = vec![0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0];
-        assert_eq!(compile_cellular_kernels(&disk).unwrap().len(), 4);
-    }
-
-    #[test]
-    fn cellular_automata_rejects_an_empty_kernel() {
-        let values = vec![0; 9];
-        let settings = CellularAutomataSettings {
-            kernel_size: 3,
-            kernel: vec![0.0; 9],
-            ..CellularAutomataSettings::default()
-        };
-
-        let error = evolve_cellular_automata(&values, 3, 3, &settings).unwrap_err();
-
-        assert!(error.contains("non-zero cell"));
+        assert_eq!(processed.cellular_automata_summary, Some(expected_summary));
+        let retained = processed.cellular_automata_result.unwrap();
+        assert_eq!(retained.size, [3, 3]);
+        assert_eq!(retained.state, expected_state);
+        assert_eq!(retained.summary, expected_summary);
     }
 
     #[test]
@@ -1139,8 +883,7 @@ mod tests {
             height: 2,
             values: vec![1, 2, 3, 4, 5, 6],
             alpha: vec![11, 12, 13, 14, 15, 16],
-            value_range: 256,
-            max_value: 255,
+            calibration: IntensityCalibration::full_scale(256).unwrap(),
             source_description: "test".to_owned(),
         };
 
@@ -1173,8 +916,8 @@ mod tests {
 
         let plane = decode_gray_plane(path).expect("float TIFF should decode through fallback");
         assert_eq!((plane.width, plane.height), (1024, 1024));
-        assert_eq!(plane.value_range, 65_536);
-        assert_eq!(plane.max_value, 65_535);
+        assert_eq!(plane.calibration.level_count(), 65_536);
+        assert_eq!(plane.calibration.maximum_value(), 65_535);
         assert!(plane.source_description.contains("32-bit float grayscale"));
     }
 
@@ -1189,7 +932,7 @@ mod tests {
         }
 
         let plane = decode_gray_plane(path).expect("float TIFF should decode through fallback");
-        let (state, summary) = evolve_cellular_automata(
+        let result = simulate_legacy(
             &plane.values,
             plane.width,
             plane.height,
@@ -1197,12 +940,13 @@ mod tests {
         )
         .expect("default cellular automata settings should evolve");
 
-        assert_eq!(state.len(), plane.width * plane.height);
-        assert!(summary.iterations_run > 0);
+        assert_eq!(result.state.len(), plane.width * plane.height);
+        assert!(result.summary.iterations_run > 0);
         assert!(
-            summary.active_fraction > 0.0 && summary.active_fraction < 1.0,
-            "default feature selection should be non-empty and selective: {summary:?}"
+            result.summary.active_fraction > 0.0 && result.summary.active_fraction < 1.0,
+            "default feature selection should be non-empty and selective: {:?}",
+            result.summary
         );
-        assert!(state.iter().all(|value| (0.0..=1.0).contains(value)));
+        assert!(result.state.iter().all(|value| (0.0..=1.0).contains(value)));
     }
 }

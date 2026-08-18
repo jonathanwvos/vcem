@@ -1,5 +1,8 @@
 pub mod analysis;
 pub mod app;
+pub mod automata;
+pub mod discrete_automata;
+pub mod quantization;
 pub mod types;
 
 use crate::app::VCEMApp;
