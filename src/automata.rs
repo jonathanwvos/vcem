@@ -2,6 +2,12 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::continuous_automata::{
+    CompiledContinuousLenia, CompiledContinuousStateInitializer, ContinuousAutomataError,
+    ContinuousCompileLimits, ContinuousDomain, ContinuousLeniaProgram, ContinuousRunConfig,
+    ContinuousSimulationResult, ContinuousStateInitializer, compile_continuous_lenia,
+    run_continuous_lenia,
+};
 use crate::discrete_automata::{
     CompactState, CompileLimits, CompiledDiscreteAutomaton, DiscreteAutomataError, DiscreteProgram,
     DiscreteRunConfig, DiscreteSimulationResult, compile_discrete_program, run_discrete_automaton,
@@ -78,7 +84,7 @@ impl Default for CellularAutomataSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct CellularAutomataSummary {
     pub iterations_run: usize,
     pub converged: bool,
@@ -89,7 +95,7 @@ pub struct CellularAutomataSummary {
 /// The numeric output of a completed cellular automata simulation.
 ///
 /// `state` is row-major and has exactly `size[0] * size[1]` entries.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CellularAutomataResult {
     pub size: [usize; 2],
     pub state: Vec<f32>,
@@ -111,6 +117,13 @@ pub struct DiscreteMapProgram {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContinuousLeniaProgramDefinition {
+    pub initializer: ContinuousStateInitializer,
+    pub program: ContinuousLeniaProgram,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "model",
     content = "definition",
@@ -120,6 +133,7 @@ pub struct DiscreteMapProgram {
 pub enum AutomataModelDefinition {
     LegacyEvidenceGrowth(LegacyEvidenceGrowthProgram),
     DiscreteMap(DiscreteMapProgram),
+    ContinuousLenia(ContinuousLeniaProgramDefinition),
 }
 
 /// A standalone program document for Automata Lab. This is intentionally
@@ -131,16 +145,29 @@ pub struct AutomataProgramDocument {
     pub transition_model: AutomataModelDefinition,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutomataCompileLimits {
+    pub discrete: CompileLimits,
+    pub continuous: ContinuousCompileLimits,
+}
+
 #[derive(Clone, Debug)]
 pub enum CompiledAutomataProgram {
     LegacyEvidenceGrowthV1(CellularAutomataSettings),
     DiscreteMapV1(CompiledDiscreteMapProgram),
+    ContinuousLeniaV1(CompiledContinuousLeniaProgram),
 }
 
 #[derive(Clone, Debug)]
 pub struct CompiledDiscreteMapProgram {
     initializer: CompiledHistogramStateInitializer,
     automaton: CompiledDiscreteAutomaton,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompiledContinuousLeniaProgram {
+    initializer: CompiledContinuousStateInitializer,
+    automaton: CompiledContinuousLenia,
 }
 
 impl CompiledDiscreteMapProgram {
@@ -177,18 +204,61 @@ impl CompiledDiscreteMapProgram {
     }
 }
 
+impl CompiledContinuousLeniaProgram {
+    pub fn initializer(&self) -> CompiledContinuousStateInitializer {
+        self.initializer
+    }
+
+    pub fn automaton(&self) -> &CompiledContinuousLenia {
+        &self.automaton
+    }
+
+    pub fn initial_state_from_intensities(
+        &self,
+        calibration: IntensityCalibration,
+        intensities: &[u32],
+        max_state_bytes: u64,
+    ) -> Result<Vec<f32>, AutomataFrameworkError> {
+        if calibration != self.initializer.calibration() {
+            return Err(AutomataFrameworkError::CalibrationMismatch {
+                expected: self.initializer.calibration(),
+                actual: calibration,
+            });
+        }
+        self.initializer
+            .initialize(intensities, max_state_bytes)
+            .map_err(AutomataFrameworkError::Continuous)
+    }
+}
+
 pub enum AutomataRunInput<'a> {
     LegacyImage(&'a [u32]),
     DiscreteState {
         state: &'a CompactState,
         config: &'a DiscreteRunConfig,
     },
+    ContinuousState {
+        state: &'a [f32],
+        config: &'a ContinuousRunConfig,
+    },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl AutomataRunInput<'_> {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::LegacyImage(_) => "legacy-image",
+            Self::DiscreteState { .. } => "discrete-state",
+            Self::ContinuousState { .. } => "continuous-state",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "model", content = "result", rename_all = "snake_case")]
 pub enum AutomataSimulationResult {
     LegacyEvidenceGrowthV1(CellularAutomataResult),
     DiscreteMapV1(DiscreteSimulationResult),
+    ContinuousLeniaV1(ContinuousSimulationResult),
 }
 
 #[derive(Debug)]
@@ -202,6 +272,10 @@ pub enum AutomataFrameworkError {
     InitializerProgramStateCountMismatch {
         initializer: u32,
         program: u32,
+    },
+    InitializerProgramDomainMismatch {
+        initializer: ContinuousDomain,
+        program: ContinuousDomain,
     },
     CalibrationMismatch {
         expected: IntensityCalibration,
@@ -218,6 +292,7 @@ pub enum AutomataFrameworkError {
     Legacy(String),
     Initializer(String),
     Discrete(DiscreteAutomataError),
+    Continuous(ContinuousAutomataError),
 }
 
 impl fmt::Display for AutomataFrameworkError {
@@ -242,6 +317,13 @@ impl fmt::Display for AutomataFrameworkError {
                 formatter,
                 "The initializer produces {initializer} states, but the discrete program expects {program}."
             ),
+            Self::InitializerProgramDomainMismatch {
+                initializer,
+                program,
+            } => write!(
+                formatter,
+                "The continuous initializer maps into {initializer:?}, but the Lenia program uses {program:?}."
+            ),
             Self::CalibrationMismatch { expected, actual } => write!(
                 formatter,
                 "Initial-state calibration {actual:?} does not match the compiled calibration {expected:?}."
@@ -259,6 +341,7 @@ impl fmt::Display for AutomataFrameworkError {
             Self::Legacy(error) => formatter.write_str(error),
             Self::Initializer(error) => formatter.write_str(error),
             Self::Discrete(error) => error.fmt(formatter),
+            Self::Continuous(error) => error.fmt(formatter),
         }
     }
 }
@@ -271,9 +354,15 @@ impl From<DiscreteAutomataError> for AutomataFrameworkError {
     }
 }
 
+impl From<ContinuousAutomataError> for AutomataFrameworkError {
+    fn from(error: ContinuousAutomataError) -> Self {
+        Self::Continuous(error)
+    }
+}
+
 pub fn compile_automata_program(
     document: AutomataProgramDocument,
-    limits: CompileLimits,
+    limits: AutomataCompileLimits,
 ) -> Result<CompiledAutomataProgram, AutomataFrameworkError> {
     if document.schema_version != AUTOMATA_PROGRAM_SCHEMA_VERSION {
         return Err(AutomataFrameworkError::UnsupportedDocumentVersion {
@@ -304,9 +393,25 @@ pub fn compile_automata_program(
                     },
                 );
             }
-            let automaton = compile_discrete_program(definition.program, limits)?;
+            let automaton = compile_discrete_program(definition.program, limits.discrete)?;
             Ok(CompiledAutomataProgram::DiscreteMapV1(
                 CompiledDiscreteMapProgram {
+                    initializer,
+                    automaton,
+                },
+            ))
+        }
+        AutomataModelDefinition::ContinuousLenia(definition) => {
+            let initializer = definition.initializer.compile()?;
+            if initializer.domain() != definition.program.domain {
+                return Err(AutomataFrameworkError::InitializerProgramDomainMismatch {
+                    initializer: initializer.domain(),
+                    program: definition.program.domain,
+                });
+            }
+            let automaton = compile_continuous_lenia(definition.program, limits.continuous)?;
+            Ok(CompiledAutomataProgram::ContinuousLeniaV1(
+                CompiledContinuousLeniaProgram {
                     initializer,
                     automaton,
                 },
@@ -337,16 +442,28 @@ pub fn run_compiled_automata(
         ) => Ok(AutomataSimulationResult::DiscreteMapV1(
             run_discrete_automaton(program.automaton(), state, width, height, config)?,
         )),
-        (CompiledAutomataProgram::LegacyEvidenceGrowthV1(_), _) => {
+        (
+            CompiledAutomataProgram::ContinuousLeniaV1(program),
+            AutomataRunInput::ContinuousState { state, config },
+        ) => Ok(AutomataSimulationResult::ContinuousLeniaV1(
+            run_continuous_lenia(program.automaton(), state, width, height, config)?,
+        )),
+        (CompiledAutomataProgram::LegacyEvidenceGrowthV1(_), input) => {
             Err(AutomataFrameworkError::IncompatibleInput {
                 model: "legacy evidence-growth",
-                input: "discrete-state",
+                input: input.label(),
             })
         }
-        (CompiledAutomataProgram::DiscreteMapV1(_), _) => {
+        (CompiledAutomataProgram::DiscreteMapV1(_), input) => {
             Err(AutomataFrameworkError::IncompatibleInput {
                 model: "discrete-map",
-                input: "legacy-image",
+                input: input.label(),
+            })
+        }
+        (CompiledAutomataProgram::ContinuousLeniaV1(_), input) => {
+            Err(AutomataFrameworkError::IncompatibleInput {
+                model: "continuous-lenia",
+                input: input.label(),
             })
         }
     }
@@ -626,10 +743,48 @@ fn reflect_coordinate(coordinate: isize, length: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::continuous_automata::{
+        CONTINUOUS_INITIALIZER_VERSION, CONTINUOUS_LENIA_PROGRAM_VERSION,
+        CONTINUOUS_RUN_CONFIG_VERSION, ContinuousBoundaryPolicy, ContinuousGrowthFunction,
+        DenseContinuousKernel, KernelNormalization,
+    };
     use crate::discrete_automata::{
         BoundaryPolicy, CompactState, DISCRETE_PROGRAM_VERSION, DISCRETE_RUN_CONFIG_VERSION,
         DiscreteRule, StateStorage,
     };
+
+    fn continuous_lenia_document(calibration: IntensityCalibration) -> AutomataProgramDocument {
+        AutomataProgramDocument {
+            schema_version: AUTOMATA_PROGRAM_SCHEMA_VERSION,
+            transition_model: AutomataModelDefinition::ContinuousLenia(
+                ContinuousLeniaProgramDefinition {
+                    initializer: ContinuousStateInitializer {
+                        version: CONTINUOUS_INITIALIZER_VERSION,
+                        calibration,
+                        domain: ContinuousDomain::UNIT,
+                    },
+                    program: ContinuousLeniaProgram {
+                        version: CONTINUOUS_LENIA_PROGRAM_VERSION,
+                        domain: ContinuousDomain::UNIT,
+                        kernel: DenseContinuousKernel {
+                            width: 1,
+                            height: 1,
+                            anchor_x: 0,
+                            anchor_y: 0,
+                            weights: vec![0.0],
+                        },
+                        kernel_normalization: KernelNormalization::None,
+                        boundary: ContinuousBoundaryPolicy::Wrap,
+                        growth: ContinuousGrowthFunction::Linear {
+                            slope: 0.0,
+                            intercept: 1.0,
+                        },
+                        time_step: 0.25,
+                    },
+                },
+            ),
+        }
+    }
 
     #[test]
     fn legacy_simulation_matches_pre_extraction_fixture() {
@@ -910,7 +1065,7 @@ mod tests {
                     },
                 ),
             },
-            CompileLimits::default(),
+            AutomataCompileLimits::default(),
         )
         .unwrap();
 
@@ -943,7 +1098,7 @@ mod tests {
                     },
                 }),
             },
-            CompileLimits::default(),
+            AutomataCompileLimits::default(),
         )
         .unwrap();
         let CompiledAutomataProgram::DiscreteMapV1(discrete) = &compiled else {
@@ -976,6 +1131,80 @@ mod tests {
     }
 
     #[test]
+    fn versioned_continuous_dispatch_initializes_and_runs_autonomously() {
+        let calibration = IntensityCalibration::full_scale(256).unwrap();
+        let compiled = compile_automata_program(
+            continuous_lenia_document(calibration),
+            AutomataCompileLimits::default(),
+        )
+        .unwrap();
+        let CompiledAutomataProgram::ContinuousLeniaV1(continuous) = &compiled else {
+            panic!("expected compiled continuous Lenia program")
+        };
+        let initial = continuous
+            .initial_state_from_intensities(calibration, &[0, 255], 8)
+            .unwrap();
+        assert_eq!(initial, [0.0, 1.0]);
+        let config = ContinuousRunConfig {
+            version: CONTINUOUS_RUN_CONFIG_VERSION,
+            cycles: 2,
+            ..ContinuousRunConfig::default()
+        };
+
+        let result = run_compiled_automata(
+            &compiled,
+            AutomataRunInput::ContinuousState {
+                state: &initial,
+                config: &config,
+            },
+            2,
+            1,
+        )
+        .unwrap();
+
+        let AutomataSimulationResult::ContinuousLeniaV1(result) = result else {
+            panic!("expected a continuous Lenia result")
+        };
+        assert_eq!(result.final_state, [0.5, 1.0]);
+        assert_eq!(result.cycles_completed, 2);
+    }
+
+    #[test]
+    fn continuous_bundle_rejects_initializer_and_provenance_mismatches() {
+        let calibration = IntensityCalibration::full_scale(256).unwrap();
+        let mut mismatched = continuous_lenia_document(calibration);
+        let AutomataModelDefinition::ContinuousLenia(definition) = &mut mismatched.transition_model
+        else {
+            unreachable!()
+        };
+        definition.initializer.domain = ContinuousDomain {
+            minimum: -1.0,
+            maximum: 1.0,
+        };
+        assert!(matches!(
+            compile_automata_program(mismatched, AutomataCompileLimits::default()),
+            Err(AutomataFrameworkError::InitializerProgramDomainMismatch { .. })
+        ));
+
+        let compiled = compile_automata_program(
+            continuous_lenia_document(calibration),
+            AutomataCompileLimits::default(),
+        )
+        .unwrap();
+        let CompiledAutomataProgram::ContinuousLeniaV1(continuous) = compiled else {
+            panic!("expected compiled continuous Lenia program")
+        };
+        assert!(matches!(
+            continuous.initial_state_from_intensities(
+                IntensityCalibration::full_scale(65_536).unwrap(),
+                &[0],
+                4,
+            ),
+            Err(AutomataFrameworkError::CalibrationMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn compiled_discrete_bundle_applies_mapped_bins_with_canonical_u16_storage() {
         let calibration = IntensityCalibration::full_scale(4096).unwrap();
         let mapping = (0..4096).map(|bin| bin % 257).collect::<Vec<_>>();
@@ -1004,7 +1233,8 @@ mod tests {
         let json = serde_json::to_string(&document).unwrap();
         let decoded: AutomataProgramDocument = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, document);
-        let compiled = compile_automata_program(document, CompileLimits::default()).unwrap();
+        let compiled =
+            compile_automata_program(document, AutomataCompileLimits::default()).unwrap();
         let CompiledAutomataProgram::DiscreteMapV1(discrete) = compiled else {
             panic!("expected compiled discrete program")
         };
@@ -1037,7 +1267,7 @@ mod tests {
             }),
         };
         assert!(matches!(
-            compile_automata_program(mismatched, CompileLimits::default()),
+            compile_automata_program(mismatched, AutomataCompileLimits::default()),
             Err(
                 AutomataFrameworkError::InitializerProgramStateCountMismatch {
                     initializer: 3,
@@ -1062,7 +1292,8 @@ mod tests {
                 },
             }),
         };
-        let compiled = compile_automata_program(matching, CompileLimits::default()).unwrap();
+        let compiled =
+            compile_automata_program(matching, AutomataCompileLimits::default()).unwrap();
         let CompiledAutomataProgram::DiscreteMapV1(discrete) = compiled else {
             panic!("expected compiled discrete program")
         };
@@ -1103,6 +1334,19 @@ mod tests {
             ),
             Err(AutomataFrameworkError::IncompatibleInput { .. })
         ));
+
+        let continuous = compile_automata_program(
+            continuous_lenia_document(IntensityCalibration::full_scale(256).unwrap()),
+            AutomataCompileLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            run_compiled_automata(&continuous, AutomataRunInput::LegacyImage(&[0]), 1, 1,),
+            Err(AutomataFrameworkError::IncompatibleInput {
+                model: "continuous-lenia",
+                input: "legacy-image",
+            })
+        ));
     }
 
     #[test]
@@ -1123,11 +1367,18 @@ mod tests {
         assert!(json.contains("\"model\":\"legacy_evidence_growth\""));
         assert!(!json.contains("continuous_lenia"));
 
-        let unsupported_lenia = r#"{
+        let continuous = continuous_lenia_document(IntensityCalibration::full_scale(256).unwrap());
+        let continuous_json = serde_json::to_string(&continuous).unwrap();
+        let decoded_continuous: AutomataProgramDocument =
+            serde_json::from_str(&continuous_json).unwrap();
+        assert_eq!(decoded_continuous, continuous);
+        assert!(continuous_json.contains("\"model\":\"continuous_lenia\""));
+
+        let unknown_model = r#"{
             "schema_version":1,
-            "transition_model":{"model":"continuous_lenia","definition":{}}
+            "transition_model":{"model":"growing_neural_ca","definition":{}}
         }"#;
-        assert!(serde_json::from_str::<AutomataProgramDocument>(unsupported_lenia).is_err());
+        assert!(serde_json::from_str::<AutomataProgramDocument>(unknown_model).is_err());
 
         let mut value = serde_json::to_value(document).unwrap();
         value
@@ -1149,7 +1400,7 @@ mod tests {
             ),
         };
         assert!(matches!(
-            compile_automata_program(unknown_document, CompileLimits::default()),
+            compile_automata_program(unknown_document, AutomataCompileLimits::default()),
             Err(AutomataFrameworkError::UnsupportedDocumentVersion { found: 99 })
         ));
 
@@ -1163,7 +1414,7 @@ mod tests {
             ),
         };
         assert!(matches!(
-            compile_automata_program(unknown_model, CompileLimits::default()),
+            compile_automata_program(unknown_model, AutomataCompileLimits::default()),
             Err(AutomataFrameworkError::UnsupportedLegacyModelVersion { found: 99 })
         ));
     }

@@ -12,9 +12,16 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
+    time::{Duration, Instant},
 };
 
 use crate::analysis::processed_image_from_path;
+use crate::automata_lab::{AutomataLabSession, LabStepOutcome, LeniaLabSettings};
+use crate::automata_projection::{
+    NumericProjectionSpec, OUTPUT_PROJECTION_VERSION, OverlayProjectionSpec, ProjectionLimits,
+    ProjectionSource, ProjectionTransfer, project_continuous_state_overlay,
+};
+use crate::continuous_automata::{ContinuousBoundaryPolicy, ContinuousDomain};
 use crate::types::{
     CellularAutomataResponse, CellularAutomataSeedMode, CellularAutomataSettings, DenoiseMethod,
     DenoiseSettings, DisplayedImage, ExperimentConfiguration, ImageFile, ImageRotation,
@@ -67,6 +74,17 @@ pub struct VCEMApp {
     configuration_error: Option<String>,
     processing_job: Option<ProcessingJob>,
     next_processing_job_id: u64,
+    automata_lab_settings: LeniaLabSettings,
+    automata_lab_session: Option<AutomataLabSession>,
+    automata_lab_job: Option<AutomataLabJob>,
+    automata_lab_texture: Option<egui::TextureHandle>,
+    automata_lab_playing: bool,
+    automata_lab_steps_per_second: f32,
+    automata_lab_cycles_per_step: u32,
+    automata_lab_last_step: Instant,
+    automata_lab_candidate_name: String,
+    automata_lab_error: Option<String>,
+    automata_lab_notice: Option<String>,
 }
 
 struct ImageCandidate {
@@ -81,6 +99,10 @@ struct ProcessingJob {
     image_index: usize,
     receiver: Receiver<ProcessingResult>,
     kind: ProcessingKind,
+}
+
+struct AutomataLabJob {
+    receiver: Receiver<Result<(AutomataLabSession, LabStepOutcome), String>>,
 }
 
 struct ProcessingResult {
@@ -132,6 +154,7 @@ enum ViewMode {
     Inspect,
     Segment,
     Measure,
+    AutomataLab,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,6 +244,17 @@ impl VCEMApp {
             configuration_error: None,
             processing_job: None,
             next_processing_job_id: 1,
+            automata_lab_settings: LeniaLabSettings::default(),
+            automata_lab_session: None,
+            automata_lab_job: None,
+            automata_lab_texture: None,
+            automata_lab_playing: false,
+            automata_lab_steps_per_second: 10.0,
+            automata_lab_cycles_per_step: 1,
+            automata_lab_last_step: Instant::now(),
+            automata_lab_candidate_name: "Candidate 1".to_owned(),
+            automata_lab_error: None,
+            automata_lab_notice: None,
         }
     }
 
@@ -273,6 +307,12 @@ impl VCEMApp {
                             .clicked()
                         {
                             view_mode = ViewMode::Measure;
+                        }
+                        if ui
+                            .selectable_label(view_mode == ViewMode::AutomataLab, "Automata Lab")
+                            .clicked()
+                        {
+                            view_mode = ViewMode::AutomataLab;
                         }
                     });
                 } else {
@@ -331,6 +371,7 @@ impl VCEMApp {
 
                     if selected_image != self.selected_image {
                         self.selected_image = selected_image;
+                        self.invalidate_automata_lab();
                         self.displayed_image = None;
                         self.viewer_error = None;
                         self.viewer_needs_fit = true;
@@ -357,6 +398,10 @@ impl VCEMApp {
     }
 
     fn show_right_panel(&mut self, ui: &mut Ui) {
+        if self.view_mode == ViewMode::AutomataLab {
+            self.show_automata_lab_right_panel(ui);
+            return;
+        }
         Panel::right("right_panel")
             .resizable(true)
             .default_size(240.0)
@@ -947,6 +992,631 @@ impl VCEMApp {
         });
     }
 
+    fn show_automata_lab_right_panel(&mut self, ui: &mut Ui) {
+        Panel::right("right_panel")
+            .resizable(true)
+            .default_size(280.0)
+            .min_size(210.0)
+            .show(ui, |ui| {
+                ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Automata Lab");
+                    ui.label("Continuous Lenia v1");
+                    ui.separator();
+
+                    if let Some(displayed) = self.displayed_image.as_ref() {
+                        ui.label(format!(
+                            "Prepared plane: {} x {}",
+                            displayed.size.x as usize, displayed.size.y as usize
+                        ));
+                        ui.label(format!(
+                            "Calibration: {}..{}",
+                            displayed.calibration.minimum, displayed.calibration.maximum_exclusive
+                        ));
+                    } else {
+                        ui.label("Load an image to initialize generation zero.");
+                    }
+
+                    ui.add_space(6.0);
+                    ui.collapsing("Kernel", |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.automata_lab_settings.kernel_size, 1..=31)
+                                .step_by(2.0)
+                                .text("Size"),
+                        );
+                        if self.automata_lab_settings.kernel_size.is_multiple_of(2) {
+                            self.automata_lab_settings.kernel_size =
+                                (self.automata_lab_settings.kernel_size + 1).min(31);
+                        }
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.automata_lab_settings.kernel_ring_center,
+                                0.0..=1.5,
+                            )
+                            .text("Ring centre"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.automata_lab_settings.kernel_ring_width,
+                                0.01..=0.75,
+                            )
+                            .text("Ring width"),
+                        );
+                        let boundary_label = match self.automata_lab_settings.boundary {
+                            ContinuousBoundaryPolicy::Clamp => "Clamp",
+                            ContinuousBoundaryPolicy::Reflect => "Reflect",
+                            ContinuousBoundaryPolicy::Wrap => "Wrap",
+                            ContinuousBoundaryPolicy::Constant { .. } => "Constant zero",
+                        };
+                        egui::ComboBox::from_label("Boundary")
+                            .selected_text(boundary_label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.automata_lab_settings.boundary,
+                                    ContinuousBoundaryPolicy::Clamp,
+                                    "Clamp",
+                                );
+                                ui.selectable_value(
+                                    &mut self.automata_lab_settings.boundary,
+                                    ContinuousBoundaryPolicy::Reflect,
+                                    "Reflect",
+                                );
+                                ui.selectable_value(
+                                    &mut self.automata_lab_settings.boundary,
+                                    ContinuousBoundaryPolicy::Wrap,
+                                    "Wrap",
+                                );
+                                ui.selectable_value(
+                                    &mut self.automata_lab_settings.boundary,
+                                    ContinuousBoundaryPolicy::Constant { value: 0.0 },
+                                    "Constant zero",
+                                );
+                            });
+                    });
+
+                    ui.collapsing("Growth", |ui| {
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.automata_lab_settings.growth_center,
+                                -0.5..=1.5,
+                            )
+                            .text("Centre"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.automata_lab_settings.growth_width,
+                                0.005..=0.5,
+                            )
+                            .text("Width"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.automata_lab_settings.time_step,
+                                0.001..=0.5,
+                            )
+                            .logarithmic(true)
+                            .text("Time step"),
+                        );
+                    });
+
+                    ui.collapsing("Playback", |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.automata_lab_cycles_per_step, 1..=32)
+                                .text("Cycles / step"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.automata_lab_steps_per_second, 1.0..=60.0)
+                                .text("Steps / second"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.automata_lab_settings.checkpoint_interval,
+                                1..=100,
+                            )
+                            .text("Checkpoint interval"),
+                        );
+                    });
+
+                    let settings_dirty = self
+                        .automata_lab_session
+                        .as_ref()
+                        .is_some_and(|session| session.settings() != &self.automata_lab_settings);
+                    if settings_dirty {
+                        self.automata_lab_playing = false;
+                        ui.colored_label(
+                            Color32::YELLOW,
+                            "Settings changed; apply them to rebuild generation zero.",
+                        );
+                    }
+
+                    let can_initialize = self.displayed_image.is_some();
+                    let has_session = self.automata_lab_session.is_some();
+                    let is_stepping = self.automata_lab_job.is_some();
+                    ui.horizontal_wrapped(|ui| {
+                        let initialize_label = if has_session {
+                            "Apply Settings & Reset"
+                        } else {
+                            "Initialize Lab"
+                        };
+                        if ui
+                            .add_enabled(can_initialize, Button::new(initialize_label))
+                            .clicked()
+                        {
+                            self.initialize_automata_lab(ui.ctx());
+                        }
+                        if ui
+                            .add_enabled(has_session && !settings_dirty, Button::new("Reset"))
+                            .clicked()
+                        {
+                            self.reset_automata_lab(ui.ctx());
+                        }
+                        if ui
+                            .add_enabled(
+                                has_session && !settings_dirty && !is_stepping,
+                                Button::new("Step"),
+                            )
+                            .clicked()
+                        {
+                            self.step_automata_lab(ui.ctx(), self.automata_lab_cycles_per_step);
+                        }
+                        let play_label = if self.automata_lab_playing {
+                            "Pause"
+                        } else {
+                            "Play"
+                        };
+                        if ui
+                            .add_enabled(has_session && !settings_dirty, Button::new(play_label))
+                            .clicked()
+                        {
+                            self.automata_lab_playing = !self.automata_lab_playing;
+                            self.automata_lab_last_step = Instant::now();
+                            ui.ctx().request_repaint();
+                        }
+                    });
+
+                    if is_stepping {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Computing the next state…");
+                        });
+                    }
+
+                    if let Some(error) = &self.automata_lab_error {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                    if let Some(notice) = &self.automata_lab_notice {
+                        ui.label(notice);
+                    }
+
+                    if let Some(session) = self.automata_lab_session.as_ref() {
+                        ui.separator();
+                        ui.strong(format!("Generation {}", session.generation()));
+                        if let Some(diagnostics) = session.last_diagnostics() {
+                            ui.label(format!(
+                                "Mean {:.4}, mass {:.2}",
+                                diagnostics.final_mean, diagnostics.final_mass
+                            ));
+                            if let Some(delta) = diagnostics.last_transition_max_delta {
+                                ui.label(format!("Last max delta {delta:.6}"));
+                            }
+                            if let Some(generation) = diagnostics.exact_fixed_point_generation {
+                                ui.label(format!("Exact fixed point from generation {generation}"));
+                            }
+                        }
+                        ui.label(format!(
+                            "History: {:.1} MiB",
+                            session.retained_history_bytes() as f64 / (1024.0 * 1024.0)
+                        ));
+                    }
+
+                    let checkpoints = self
+                        .automata_lab_session
+                        .as_ref()
+                        .map(|session| {
+                            session
+                                .checkpoints()
+                                .iter()
+                                .enumerate()
+                                .map(|(index, checkpoint)| (index, checkpoint.generation))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if !checkpoints.is_empty() {
+                        ui.separator();
+                        ui.collapsing("Timeline", |ui| {
+                            let mut restore = None;
+                            for (index, generation) in &checkpoints {
+                                if ui
+                                    .add_enabled(
+                                        !is_stepping,
+                                        Button::new(format!("Generation {generation}")),
+                                    )
+                                    .clicked()
+                                {
+                                    restore = Some(*index);
+                                }
+                            }
+                            if let Some(index) = restore {
+                                self.restore_automata_lab_checkpoint(ui.ctx(), index);
+                            }
+                        });
+                    }
+
+                    if has_session {
+                        ui.separator();
+                        ui.collapsing("Candidate snapshots", |ui| {
+                            ui.text_edit_singleline(&mut self.automata_lab_candidate_name);
+                            if ui
+                                .add_enabled(!is_stepping, Button::new("Save Current"))
+                                .clicked()
+                            {
+                                self.save_automata_lab_candidate();
+                            }
+                            let candidates = self
+                                .automata_lab_session
+                                .as_ref()
+                                .map(|session| {
+                                    session
+                                        .candidates()
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, candidate)| {
+                                            (index, candidate.name.clone(), candidate.generation)
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            let mut restore = None;
+                            for (index, name, generation) in candidates {
+                                if ui
+                                    .add_enabled(
+                                        !is_stepping,
+                                        Button::new(format!("{name} — generation {generation}")),
+                                    )
+                                    .clicked()
+                                {
+                                    restore = Some(index);
+                                }
+                            }
+                            if let Some(index) = restore {
+                                self.restore_automata_lab_candidate(ui.ctx(), index);
+                            }
+                        });
+                    }
+                });
+            });
+    }
+
+    fn show_automata_lab_central_panel(&mut self, ui: &mut Ui) {
+        CentralPanel::default_margins().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Automata Lab");
+                if self.selected_image.is_some() {
+                    ui.separator();
+                    if ui.button("Fit").clicked() {
+                        self.viewer_needs_fit = true;
+                    }
+                }
+                if let Some(session) = self.automata_lab_session.as_ref() {
+                    ui.separator();
+                    ui.label(format!("Generation {}", session.generation()));
+                }
+            });
+            ui.separator();
+
+            let available_size = ui.available_size().max(Vec2::splat(1.0));
+            let (canvas_rect, response) =
+                ui.allocate_exact_size(available_size, Sense::click_and_drag());
+            let painter = ui.painter_at(canvas_rect);
+            painter.rect_filled(canvas_rect, 0.0, ui.visuals().extreme_bg_color);
+
+            self.ensure_selected_image_loaded(ui.ctx());
+            let Some((texture_id, image_size)) = self
+                .displayed_image
+                .as_ref()
+                .map(|displayed| (displayed.texture.id(), displayed.size))
+            else {
+                painter.text(
+                    canvas_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Add an image to begin",
+                    egui::TextStyle::Heading.resolve(ui.style()),
+                    ui.visuals().weak_text_color(),
+                );
+                return;
+            };
+
+            if self.viewer_needs_fit {
+                self.viewer_zoom = (canvas_rect.width() / image_size.x)
+                    .min(canvas_rect.height() / image_size.y)
+                    .clamp(0.05, 16.0);
+                self.viewer_pan = Vec2::ZERO;
+                self.viewer_needs_fit = false;
+            }
+            if response.dragged_by(PointerButton::Secondary) {
+                self.viewer_pan += response.drag_delta();
+            }
+            if response.hovered() {
+                let (scroll_delta, zoom_delta, pointer_pos) = ui.input(|input| {
+                    (
+                        input.smooth_scroll_delta().y,
+                        input.zoom_delta(),
+                        input.pointer.latest_pos(),
+                    )
+                });
+                let combined_zoom_delta = (scroll_delta * 0.002).exp() * zoom_delta;
+                if combined_zoom_delta != 1.0 {
+                    self.zoom_around_pointer(
+                        combined_zoom_delta,
+                        pointer_pos.unwrap_or(canvas_rect.center()),
+                        canvas_rect,
+                    );
+                }
+            }
+
+            let image_rect = Rect::from_center_size(
+                canvas_rect.center() + self.viewer_pan,
+                image_size * self.viewer_zoom,
+            );
+            painter.image(
+                texture_id,
+                image_rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            if let Some(texture) = &self.automata_lab_texture {
+                painter.image(
+                    texture.id(),
+                    image_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            painter.rect_stroke(
+                canvas_rect,
+                0.0,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        });
+    }
+
+    fn initialize_automata_lab(&mut self, ctx: &egui::Context) {
+        self.automata_lab_playing = false;
+        self.automata_lab_job = None;
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+
+        let Some(displayed) = self.displayed_image.as_ref() else {
+            self.automata_lab_error = Some(
+                "Wait for the selected image to finish loading before initializing the Lab."
+                    .to_owned(),
+            );
+            return;
+        };
+        let size = [displayed.size.x as usize, displayed.size.y as usize];
+        match AutomataLabSession::new(
+            &displayed.prepared_values,
+            displayed.calibration,
+            size,
+            self.automata_lab_settings.clone(),
+        ) {
+            Ok(session) => {
+                self.automata_lab_session = Some(session);
+                self.automata_lab_notice = Some(
+                    "Generation zero was initialized from the prepared image plane.".to_owned(),
+                );
+                self.refresh_automata_lab_texture(ctx);
+            }
+            Err(error) => {
+                self.automata_lab_session = None;
+                self.automata_lab_texture = None;
+                self.automata_lab_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn reset_automata_lab(&mut self, ctx: &egui::Context) {
+        self.automata_lab_playing = false;
+        self.automata_lab_job = None;
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        if let Some(session) = self.automata_lab_session.as_mut() {
+            session.reset();
+            self.automata_lab_notice = Some("Restored generation zero.".to_owned());
+            self.refresh_automata_lab_texture(ctx);
+        }
+    }
+
+    fn step_automata_lab(&mut self, ctx: &egui::Context, cycles: u32) {
+        if self.automata_lab_job.is_some() {
+            return;
+        }
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        let Some(mut session) = self.automata_lab_session.clone() else {
+            self.automata_lab_error = Some("Initialize the Automata Lab first.".to_owned());
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let repaint_ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = session
+                .step(cycles)
+                .map(|outcome| (session, outcome))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            repaint_ctx.request_repaint();
+        });
+        self.automata_lab_job = Some(AutomataLabJob { receiver });
+        ctx.request_repaint();
+    }
+
+    fn poll_automata_lab_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.automata_lab_job.as_ref() else {
+            return;
+        };
+        let result = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(16));
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("The Automata Lab worker stopped before returning a state.".to_owned())
+            }
+        };
+        self.automata_lab_job = None;
+        match result {
+            Ok((session, outcome)) => {
+                self.automata_lab_session = Some(session);
+                if outcome.checkpoint_skipped_for_budget {
+                    self.automata_lab_notice = Some(
+                        "The step completed, but its timeline checkpoint exceeded the history budget."
+                            .to_owned(),
+                    );
+                }
+                self.refresh_automata_lab_texture(ctx);
+            }
+            Err(error) => {
+                self.automata_lab_playing = false;
+                self.automata_lab_error = Some(error);
+            }
+        }
+    }
+
+    fn restore_automata_lab_checkpoint(&mut self, ctx: &egui::Context, index: usize) {
+        self.automata_lab_playing = false;
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        let result = self
+            .automata_lab_session
+            .as_mut()
+            .ok_or_else(|| "Initialize the Automata Lab first.".to_owned())
+            .and_then(|session| {
+                session
+                    .restore_checkpoint(index)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                self.automata_lab_notice = Some("Restored timeline checkpoint.".to_owned());
+                self.refresh_automata_lab_texture(ctx);
+            }
+            Err(error) => self.automata_lab_error = Some(error),
+        }
+    }
+
+    fn save_automata_lab_candidate(&mut self) {
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        let name = self.automata_lab_candidate_name.trim().to_owned();
+        let result = self
+            .automata_lab_session
+            .as_mut()
+            .ok_or_else(|| "Initialize the Automata Lab first.".to_owned())
+            .and_then(|session| {
+                session
+                    .save_candidate(&name)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                let candidate_number = self
+                    .automata_lab_session
+                    .as_ref()
+                    .map_or(1, |session| session.candidates().len() + 1);
+                self.automata_lab_candidate_name = format!("Candidate {candidate_number}");
+                self.automata_lab_notice = Some(format!("Saved candidate {name:?}."));
+            }
+            Err(error) => self.automata_lab_error = Some(error),
+        }
+    }
+
+    fn restore_automata_lab_candidate(&mut self, ctx: &egui::Context, index: usize) {
+        self.automata_lab_playing = false;
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        let result = self
+            .automata_lab_session
+            .as_mut()
+            .ok_or_else(|| "Initialize the Automata Lab first.".to_owned())
+            .and_then(|session| {
+                session
+                    .restore_candidate(index)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                self.automata_lab_notice = Some("Restored candidate snapshot.".to_owned());
+                self.refresh_automata_lab_texture(ctx);
+            }
+            Err(error) => self.automata_lab_error = Some(error),
+        }
+    }
+
+    fn refresh_automata_lab_texture(&mut self, ctx: &egui::Context) {
+        let Some(session) = self.automata_lab_session.as_ref() else {
+            self.automata_lab_texture = None;
+            return;
+        };
+        let specification = OverlayProjectionSpec {
+            version: OUTPUT_PROJECTION_VERSION,
+            field: NumericProjectionSpec {
+                version: OUTPUT_PROJECTION_VERSION,
+                source: ProjectionSource::NormalizedFinalState,
+                transfer: ProjectionTransfer::Power { exponent: 0.5 },
+            },
+            color: [48, 221, 255],
+            maximum_alpha: 224,
+        };
+        match project_continuous_state_overlay(
+            session.current_state(),
+            session.size(),
+            ContinuousDomain::UNIT,
+            &specification,
+            ProjectionLimits::default(),
+        ) {
+            Ok(overlay) => {
+                let color_image =
+                    egui::ColorImage::from_rgba_unmultiplied(overlay.size, &overlay.rgba);
+                self.automata_lab_texture = Some(ctx.load_texture(
+                    "Automata Lab state overlay",
+                    color_image,
+                    TextureOptions::LINEAR,
+                ));
+            }
+            Err(error) => {
+                self.automata_lab_playing = false;
+                self.automata_lab_texture = None;
+                self.automata_lab_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn advance_automata_lab(&mut self, ctx: &egui::Context) {
+        if !self.automata_lab_playing || self.view_mode != ViewMode::AutomataLab {
+            return;
+        }
+        let interval = Duration::from_secs_f32(1.0 / self.automata_lab_steps_per_second.max(1.0));
+        let elapsed = self.automata_lab_last_step.elapsed();
+        if elapsed >= interval {
+            self.automata_lab_last_step = Instant::now();
+            self.step_automata_lab(ctx, self.automata_lab_cycles_per_step);
+        }
+        if self.automata_lab_playing {
+            ctx.request_repaint_after(interval.saturating_sub(elapsed));
+        }
+    }
+
+    fn invalidate_automata_lab(&mut self) {
+        self.automata_lab_playing = false;
+        self.automata_lab_job = None;
+        self.automata_lab_session = None;
+        self.automata_lab_texture = None;
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+    }
+
     fn show_bottom_panel(&mut self, ui: &mut Ui) {
         Panel::bottom("bottom_panel")
             .resizable(true)
@@ -965,11 +1635,28 @@ impl VCEMApp {
 
                     ui.separator();
                     ui.label(format!("Zoom {:.0}%", self.viewer_zoom * 100.0));
+                    if self.view_mode == ViewMode::AutomataLab {
+                        if let Some(session) = self.automata_lab_session.as_ref() {
+                            ui.separator();
+                            ui.label(format!("Generation {}", session.generation()));
+                        }
+                        if self.automata_lab_job.is_some() {
+                            ui.separator();
+                            ui.label("Computing");
+                        } else if self.automata_lab_playing {
+                            ui.separator();
+                            ui.label("Playing");
+                        }
+                    }
                 });
             });
     }
 
     fn show_central_panel(&mut self, ui: &mut Ui) {
+        if self.view_mode == ViewMode::AutomataLab {
+            self.show_automata_lab_central_panel(ui);
+            return;
+        }
         CentralPanel::default_margins().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Image Viewer");
@@ -1511,6 +2198,7 @@ impl VCEMApp {
 
         if let Some(index) = first_added {
             self.selected_image = Some(index);
+            self.invalidate_automata_lab();
             self.displayed_image = None;
             self.viewer_error = None;
             self.viewer_needs_fit = true;
@@ -1858,6 +2546,7 @@ impl VCEMApp {
         self.reset_histogram_view = true;
         self.reset_cellular_response_view = true;
         self.clear_histogram_highlight();
+        self.invalidate_automata_lab();
         self.displayed_image = None;
         self.viewer_needs_fit = true;
         self.applied_denoise = None;
@@ -1941,8 +2630,11 @@ impl VCEMApp {
 
         match result.result {
             Ok(processed) => {
+                self.invalidate_automata_lab();
                 let texture_name = result.kind.texture_name(&result.image_name);
                 let size = processed.size;
+                let prepared_values = processed.prepared_values;
+                let calibration = processed.calibration;
                 let histogram = processed.histogram;
                 let bin_indices = processed.bin_indices;
                 let bin_count = processed.bin_count;
@@ -1963,6 +2655,8 @@ impl VCEMApp {
                     image_index: result.image_index,
                     size,
                     texture,
+                    prepared_values,
+                    calibration,
                     bin_indices,
                     bin_count,
                     highlight_bins: Vec::new(),
@@ -2731,6 +3425,8 @@ impl DenoiseMethod {
 impl App for VCEMApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
         self.poll_processing_job(ui.ctx());
+        self.poll_automata_lab_job(ui.ctx());
+        self.advance_automata_lab(ui.ctx());
         self.show_upper_panel(ui);
         self.show_left_panel(ui);
         self.show_right_panel(ui);

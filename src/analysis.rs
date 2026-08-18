@@ -7,7 +7,11 @@ use tiff::{
     decoder::{Decoder, DecodingResult},
 };
 
-use crate::automata::{CellularAutomataResult, simulate_legacy};
+use crate::automata::{AutomataSimulationResult, CellularAutomataResult, simulate_legacy};
+use crate::automata_projection::{
+    NumericProjectionSpec, OUTPUT_PROJECTION_VERSION, OverlayProjectionSpec, ProjectionLimits,
+    ProjectionSource, ProjectionTransfer, project_rgba_overlay,
+};
 use crate::quantization::{
     CompiledHistogramStateInitializer, HistogramStateInitializer, IntensityCalibration,
     QuantizedHistogram, QuantizedIntensities,
@@ -112,7 +116,7 @@ pub fn processed_image_from_path(
     let quantized = quantizer.quantize(&plane.values)?;
 
     process_values(
-        &plane.values,
+        plane.values,
         &plane.alpha,
         [plane.width, plane.height],
         plane.calibration.maximum_value(),
@@ -704,15 +708,28 @@ fn cellular_automata_overlay(
     settings: &CellularAutomataSettings,
 ) -> std::result::Result<(ColorImage, CellularAutomataResult), String> {
     let result = simulate_legacy(values, width, height, settings)?;
-    let mut rgba = Vec::with_capacity(result.state.len() * 4);
-
-    for activation in &result.state {
-        let alpha = (activation.sqrt() * 190.0).round().clamp(0.0, 190.0) as u8;
-        rgba.extend_from_slice(&[30, 210, 190, alpha]);
-    }
+    let projection_result = AutomataSimulationResult::LegacyEvidenceGrowthV1(result);
+    let overlay = project_rgba_overlay(
+        &projection_result,
+        &OverlayProjectionSpec {
+            version: OUTPUT_PROJECTION_VERSION,
+            field: NumericProjectionSpec {
+                version: OUTPUT_PROJECTION_VERSION,
+                source: ProjectionSource::NormalizedFinalState,
+                transfer: ProjectionTransfer::Power { exponent: 0.5 },
+            },
+            color: [30, 210, 190],
+            maximum_alpha: 190,
+        },
+        ProjectionLimits::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let AutomataSimulationResult::LegacyEvidenceGrowthV1(result) = projection_result else {
+        unreachable!("the legacy result variant was constructed immediately above")
+    };
 
     Ok((
-        ColorImage::from_rgba_unmultiplied([width, height], &rgba),
+        ColorImage::from_rgba_unmultiplied([width, height], &overlay.rgba),
         result,
     ))
 }
@@ -746,7 +763,7 @@ fn histogram_from_counts(
 }
 
 fn process_values(
-    values: &[u32],
+    values: Vec<u32>,
     alpha: &[u8],
     size: [usize; 2],
     display_max: u32,
@@ -805,6 +822,8 @@ fn process_values(
     Ok(ProcessedImage {
         size: Vec2::new(size[0] as f32, size[1] as f32),
         color_image: ColorImage::from_rgba_unmultiplied(size, &rgba),
+        prepared_values: values,
+        calibration,
         histogram,
         bin_indices,
         bin_count,
@@ -859,7 +878,7 @@ mod tests {
                 .unwrap();
         let quantized = quantizer.quantize(&values).unwrap();
         let processed = process_values(
-            &values,
+            values,
             &[255; 9],
             [3, 3],
             255,
@@ -869,6 +888,14 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            processed.prepared_values,
+            [0, 32, 64, 96, 128, 160, 192, 224, 255]
+        );
+        assert_eq!(
+            processed.calibration,
+            IntensityCalibration::full_scale(256).unwrap()
+        );
         assert_eq!(processed.cellular_automata_summary, Some(expected_summary));
         let retained = processed.cellular_automata_result.unwrap();
         assert_eq!(retained.size, [3, 3]);

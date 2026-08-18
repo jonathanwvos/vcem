@@ -1,6 +1,10 @@
 pub mod analysis;
 pub mod app;
 pub mod automata;
+pub mod automata_experiment;
+pub mod automata_lab;
+pub mod automata_projection;
+pub mod continuous_automata;
 pub mod discrete_automata;
 pub mod quantization;
 pub mod types;

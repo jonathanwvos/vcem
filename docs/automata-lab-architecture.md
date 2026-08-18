@@ -7,10 +7,15 @@
 ## Implementation status
 
 - Stage 1 is complete: the legacy image-conditioned evaluator is a UI-free numeric engine and its final state is retained independently from rendering.
-- Stage 2A is complete: strict versioned program documents contain either the real legacy model or a discrete-map model together with its histogram initializer. No placeholder Lenia variant is serialized.
+- Stage 2A established strict versioned program documents with the real legacy and discrete-map models plus the histogram initializer. Lenia was added only when its real engine became available; no placeholder model was serialized.
 - Discrete execution currently supports direct, aggregate rounded-mean/sum, ordered-neighbourhood, and explicitly reduced presence-triggered maps; compact `u8`/`u16`/`u32` buffers; checked dense tables; synchronous parallel stepping; fixed-point and period-two detection; and opt-in budgeted exact cycle detection.
 - The canonical histogram quantizer and calibrated generation-zero bridge were pulled forward from Stage 3 because they are required to compile a discrete program without allowing its initializer and state cardinality to drift apart.
-- Stage 2B, autonomous continuous Lenia, is next. GUI authoring and Automata Lab playback remain later stages.
+- Stage 2B is complete: `ContinuousLenia` is a real strict program variant with calibrated continuous initialization, a dense anchored kernel, explicit normalization and boundary policies, built-in growth functions, synchronous parallel evolution, clamped numeric results, and convergence diagnostics.
+- Continuous execution is autonomous after generation zero and contains neither source-evidence gating nor an independent decay term. Exact fixed points may be safely fast-forwarded; approximate convergence is diagnostic only and never shortens the requested run.
+- Stage 3 is complete at the engine boundary. Versioned projections derive normalized scalar fields, discrete-state membership, masks, and RGBA overlays from any validated final result without rerunning a model. The normal legacy overlay now uses this projection path with its original palette and square-root alpha transfer.
+- Versioned run records bind an immutable prepared-plane identity, source identity, calibration, experiment/ROI lineage, complete program document, model-specific run specification, optional deterministic seed, and validated numeric result.
+- The first Stage 4 interactive slice is complete for continuous Lenia. A dedicated Automata Lab view retains the selected image's calibrated prepared plane, initializes generation zero from that plane, renders the current numeric state as a disposable superimposed projection, and exposes Reset, background-threaded Step, timed Play/Pause, diagnostics, budgeted in-memory timeline checkpoints, and named candidate snapshots.
+- Lab sessions are invalidated when image selection or preprocessing changes, so a state cannot silently outlive the prepared plane that initialized it. Editing transition settings pauses playback and requires an explicit apply-and-reset operation. Persisted Lab experiments, discrete rule authoring, richer timeline capture, and ROI child tabs remain subsequent Stage 4/5 work.
 
 ## Context
 
@@ -85,6 +90,8 @@ The initial continuous model is autonomous Lenia-style evolution:
 
 The image supplies `a(0)` only. The model has an explicit kernel, kernel normalization policy, boundary policy, growth response `G`, time step, clamp/domain policy, and cycle count. It has no independent linear decay term: suppression or extinction must emerge from the growth response and repeated transitions.
 
+The implemented v1 kernel is a dense row-major rectangle with an explicit anchor. It can be left unnormalized, normalized by its signed sum, or normalized by its L1 norm. Clamp, reflect, wrap, and constant boundary policies are supported. V1 growth families are Gaussian, band, and linear; the canonical Lenia Gaussian is represented as a parameterization of the Gaussian family rather than a separate evaluator.
+
 Initial authoring uses built-in, serialized response families and parameters. A later authoring stage may add piecewise curves and a whitelisted mathematical expression language. Expressions must compile to a validated, deterministic representation with bounded evaluation and no I/O, loops, allocation, or arbitrary host-code execution.
 
 #### Legacy compatibility
@@ -102,6 +109,8 @@ The canonical result is numeric rather than an RGBA texture. A `SimulationResult
 
 Rendering is a downstream projection. An `OutputProjection` can reproduce the current superimposed overlay, but changing its palette, threshold, opacity, or selected states does not rerun or mutate the automaton. Numeric projections also provide the future inputs for validated-model composition, including masks, final activation, temporal maxima, occupancy, and change frequency.
 
+Projection v1 implements normalized final-state fields for all three model families, discrete-state membership, threshold masks, and configurable single-colour RGBA overlays. Transfer functions are identity, power, and linear windowing. Temporal projections remain deferred until checkpoint capture exists in Stage 4.
+
 ### Experiments and ROI lineage
 
 An `Experiment` owns one source reference, initializer, automata program, run specification, annotations, and result revisions. An ROI action creates a child experiment rather than an unrelated crop. The child records:
@@ -113,6 +122,8 @@ An `Experiment` owns one source reference, initializer, automata program, run sp
 - subsequent program, annotation, and result revisions.
 
 This lineage makes manual and automated selection experiments auditable and allows successful rules to be evaluated against other regions or images without losing their origin.
+
+The implemented run-provenance record stores this lineage together with stable source and prepared-plane identifiers. The prepared-plane identifier is the reproducibility boundary for current float-TIFF inputs: independently decoding a crop remains invalid until the raw normalization and preprocessing transform are structured rather than merely identified.
 
 ### Evolution and composition
 

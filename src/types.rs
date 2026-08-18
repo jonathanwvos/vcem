@@ -18,6 +18,8 @@ pub struct DisplayedImage {
     pub image_index: usize,
     pub size: Vec2,
     pub texture: TextureHandle,
+    pub prepared_values: Vec<u32>,
+    pub calibration: IntensityCalibration,
     pub bin_indices: Vec<u32>,
     pub bin_count: usize,
     pub highlight_bins: Vec<usize>,
@@ -30,6 +32,8 @@ pub struct DisplayedImage {
 pub struct ProcessedImage {
     pub size: Vec2,
     pub color_image: ColorImage,
+    pub prepared_values: Vec<u32>,
+    pub calibration: IntensityCalibration,
     pub histogram: IntensityHistogram,
     pub bin_indices: Vec<u32>,
     pub bin_count: usize,
