@@ -32,8 +32,8 @@ use crate::automata_projection::{
 use crate::continuous_automata::{ContinuousBoundaryPolicy, ContinuousDomain};
 use crate::types::{
     CellularAutomataResponse, CellularAutomataSeedMode, CellularAutomataSettings, DenoiseMethod,
-    DenoiseSettings, DisplayedImage, ExperimentConfiguration, ImageFile, ImageRotation,
-    IntensityHistogram, ProcessedImage,
+    DenoiseSettings, DisplayedImage, DownsamplingMethod, ExperimentConfiguration, ImageFile,
+    ImageRotation, IntensityHistogram, ProcessedImage,
 };
 
 pub struct VCEMApp {
@@ -59,6 +59,8 @@ pub struct VCEMApp {
     selected_histogram_bins: BTreeSet<usize>,
     image_selection_start: Option<Pos2>,
     histogram_selection_start_bin: Option<usize>,
+    downsampling: DownsamplingMethod,
+    applied_downsampling: DownsamplingMethod,
     rotation: ImageRotation,
     applied_rotation: ImageRotation,
     denoise_method: DenoiseMethod,
@@ -128,6 +130,7 @@ struct ProcessingResult {
 #[derive(Clone)]
 enum ProcessingKind {
     Preview(ExperimentConfiguration),
+    Downsampling(ExperimentConfiguration),
     Rotation(ExperimentConfiguration),
     Denoise(ExperimentConfiguration),
     Invert(ExperimentConfiguration),
@@ -203,6 +206,10 @@ impl HistogramBinCountControl {
 
 impl VCEMApp {
     pub fn new(_: &CreationContext<'_>) -> Self {
+        Self::initial_state()
+    }
+
+    fn initial_state() -> Self {
         let current_dir = std::env::current_dir().unwrap_or_default();
         let image_picker_dir = current_dir.display().to_string();
         let configuration_path = current_dir
@@ -233,6 +240,8 @@ impl VCEMApp {
             selected_histogram_bins: BTreeSet::new(),
             image_selection_start: None,
             histogram_selection_start_bin: None,
+            downsampling: DownsamplingMethod::default(),
+            applied_downsampling: DownsamplingMethod::default(),
             rotation: ImageRotation::None,
             applied_rotation: ImageRotation::None,
             denoise_method: DenoiseMethod::None,
@@ -393,6 +402,7 @@ impl VCEMApp {
                         self.histogram_error = None;
                         self.reset_histogram_view = true;
                         self.clear_histogram_highlight();
+                        self.downsampling = self.applied_downsampling;
                         self.applied_denoise = None;
                         self.invert_values = false;
                         self.applied_invert = false;
@@ -409,6 +419,48 @@ impl VCEMApp {
                     }
                 }
             });
+    }
+
+    fn show_downsampling_controls(&mut self, ui: &mut Ui, is_processing: bool) {
+        ui.heading("Downsampling");
+        ui.separator();
+        ui.add_enabled_ui(!is_processing, |ui| {
+            egui::ComboBox::from_id_salt("downsampling_method")
+                .selected_text(self.downsampling.label())
+                .show_ui(ui, |ui| {
+                    if self.downsampling == DownsamplingMethod::Legacy {
+                        ui.selectable_value(&mut self.downsampling, DownsamplingMethod::Legacy, DownsamplingMethod::Legacy.label());
+                    }
+                    for method in [DownsamplingMethod::Nearest, DownsamplingMethod::AreaAverage, DownsamplingMethod::Triangle] {
+                        ui.selectable_value(&mut self.downsampling, method, method.label());
+                    }
+                }).response.on_hover_text("Changes the reduced image used by the viewer, histogram, and cellular automata.");
+            if ui.add_enabled(self.downsampling != self.applied_downsampling, Button::new("Apply Downsampling")).clicked() {
+                self.apply_downsampling(ui.ctx());
+            }
+        });
+        ui.small(format!("Applied: {}", self.applied_downsampling.label()));
+    }
+
+    fn apply_downsampling(&mut self, ctx: &egui::Context) {
+        let Some((image_index, path, name)) = self.selected_image.and_then(|index| {
+            self.images
+                .get(index)
+                .map(|image| (index, image.path.clone(), image.name.clone()))
+        }) else {
+            return;
+        };
+        self.viewer_error = None;
+        self.histogram_error = None;
+        let mut parameters = self.applied_experiment_configuration();
+        parameters.downsampling = self.downsampling;
+        self.start_processing_job(
+            ctx,
+            image_index,
+            path,
+            name,
+            ProcessingKind::Downsampling(parameters),
+        );
     }
 
     fn show_right_panel(&mut self, ui: &mut Ui) {
@@ -448,6 +500,8 @@ impl VCEMApp {
                         }
 
                         ui.add_space(5.0);
+                        self.show_downsampling_controls(ui, is_processing);
+                        ui.add_space(8.0);
                         ui.heading("Image Augmentations");
                         ui.separator();
                         if ui
@@ -2303,6 +2357,7 @@ impl VCEMApp {
             self.histogram_error = None;
             self.reset_histogram_view = true;
             self.clear_histogram_highlight();
+            self.downsampling = self.applied_downsampling;
             self.applied_denoise = None;
             self.invert_values = false;
             self.applied_invert = false;
@@ -2354,6 +2409,7 @@ impl VCEMApp {
     fn applied_experiment_configuration(&self) -> ExperimentConfiguration {
         ExperimentConfiguration {
             schema_version: 1,
+            downsampling: self.applied_downsampling,
             histogram_bin_count: self.histogram_bin_count.applied(),
             rotation: self.applied_rotation,
             denoise: self.applied_denoise,
@@ -2618,6 +2674,7 @@ impl VCEMApp {
         self.histogram_bin_count
             .set(configuration.histogram_bin_count);
         self.reset_cellular_response_view = true;
+        self.downsampling = configuration.downsampling;
         self.rotation = configuration.rotation;
         self.denoise_method = configuration
             .denoise
@@ -2646,6 +2703,7 @@ impl VCEMApp {
         self.invalidate_automata_lab();
         self.displayed_image = None;
         self.viewer_needs_fit = true;
+        self.downsampling = self.applied_downsampling;
         self.applied_denoise = None;
         self.invert_values = false;
         self.applied_invert = false;
@@ -2728,6 +2786,9 @@ impl VCEMApp {
         match result.result {
             Ok(processed) => {
                 self.invalidate_automata_lab();
+                if result.kind.parameters().downsampling != self.applied_downsampling {
+                    self.clear_histogram_highlight();
+                }
                 let texture_name = result.kind.texture_name(&result.image_name);
                 let size = processed.size;
                 let prepared_values = processed.prepared_values;
@@ -2973,6 +3034,7 @@ impl ProcessingKind {
     fn label(&self) -> &'static str {
         match self {
             Self::Preview(_) => "preview",
+            Self::Downsampling(_) => "downsampling",
             Self::Rotation(_) => "rotation",
             Self::Denoise(_) => "denoising",
             Self::Invert(_) => "inversion",
@@ -2986,6 +3048,9 @@ impl ProcessingKind {
     fn texture_name(&self, image_name: &str) -> String {
         match self {
             Self::Preview(_) => format!("{image_name} preview"),
+            Self::Downsampling(parameters) => {
+                format!("{image_name} {}", parameters.downsampling.label())
+            }
             Self::Rotation(parameters) => {
                 format!("{image_name} rotated {}", parameters.rotation.degrees())
             }
@@ -3029,6 +3094,7 @@ impl ProcessingKind {
     fn parameters(&self) -> &ExperimentConfiguration {
         match self {
             Self::Preview(parameters)
+            | Self::Downsampling(parameters)
             | Self::Rotation(parameters)
             | Self::Denoise(parameters)
             | Self::Invert(parameters)
@@ -3042,6 +3108,11 @@ impl ProcessingKind {
     fn apply_to(self, app: &mut VCEMApp) {
         match self {
             Self::Preview(_) => {}
+            Self::Downsampling(parameters) => {
+                app.applied_downsampling = parameters.downsampling;
+                app.downsampling = parameters.downsampling;
+                app.clear_histogram_highlight();
+            }
             Self::Rotation(parameters) => {
                 app.applied_rotation = parameters.rotation;
                 app.rotation = parameters.rotation;
@@ -3076,6 +3147,8 @@ impl ProcessingKind {
 impl ExperimentConfiguration {
     fn apply_as_current(self, app: &mut VCEMApp) {
         app.histogram_bin_count.set(self.histogram_bin_count);
+        app.applied_downsampling = self.downsampling;
+        app.downsampling = self.downsampling;
         app.applied_rotation = self.rotation;
         app.rotation = self.rotation;
         app.applied_denoise = self.denoise;
@@ -3538,6 +3611,130 @@ mod tests {
     use super::{
         CellularKernelBrush, HistogramBinCountControl, toggle_kernel_weight, toggled_kernel_brush,
     };
+
+    #[test]
+    fn downsampling_applies_atomically_and_persists_across_configuration_and_frames() {
+        use super::*;
+        let ctx = egui::Context::default();
+        let mut app = VCEMApp::initial_state();
+        let dir =
+            std::env::temp_dir().join(format!("vcem-downsampling-app-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("source.png");
+        image::GrayImage::from_fn(8, 8, |x, y| image::Luma([(x * y * 4) as u8]))
+            .save(&path)
+            .unwrap();
+        app.add_image_paths(vec![path.clone()]);
+        app.applied_gamma = Some(1.2);
+        app.applied_cellular_automata = Some(CellularAutomataSettings {
+            iterations: 1,
+            ..Default::default()
+        });
+
+        let finish = |app: &mut VCEMApp| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while app.processing_job.is_some() {
+                assert!(Instant::now() < deadline, "image processing timed out");
+                app.poll_processing_job(&ctx);
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        app.downsampling = DownsamplingMethod::Nearest;
+        app.apply_downsampling(&ctx);
+        assert_eq!(app.applied_downsampling, DownsamplingMethod::AreaAverage);
+        finish(&mut app);
+        assert!(app.viewer_error.is_none(), "{:?}", app.viewer_error);
+        assert_eq!(app.applied_downsampling, DownsamplingMethod::Nearest);
+        assert!(
+            app.displayed_image
+                .as_ref()
+                .unwrap()
+                .cellular_automata_result
+                .is_some()
+        );
+        assert_eq!(app.applied_gamma, Some(1.2));
+
+        app.initialize_automata_lab(&ctx);
+        assert!(
+            app.automata_lab_session.is_some(),
+            "{:?}",
+            app.automata_lab_error
+        );
+        app.selected_histogram_bins.insert(1);
+        app.downsampling = DownsamplingMethod::Triangle;
+        app.apply_downsampling(&ctx);
+        finish(&mut app);
+        assert_eq!(app.applied_downsampling, DownsamplingMethod::Triangle);
+        assert!(app.selected_histogram_bins.is_empty());
+        assert!(app.automata_lab_session.is_none());
+        assert!(
+            app.histogram
+                .as_ref()
+                .unwrap()
+                .source_description
+                .contains("Triangle")
+        );
+
+        let previous_pixels = app
+            .displayed_image
+            .as_ref()
+            .unwrap()
+            .prepared_values
+            .clone();
+        app.images[0].path = dir.join("missing.png");
+        app.downsampling = DownsamplingMethod::AreaAverage;
+        app.apply_downsampling(&ctx);
+        finish(&mut app);
+        assert!(app.viewer_error.is_some());
+        assert_eq!(app.applied_downsampling, DownsamplingMethod::Triangle);
+        assert_eq!(
+            app.displayed_image.as_ref().unwrap().prepared_values,
+            previous_pixels
+        );
+        assert!(
+            app.histogram
+                .as_ref()
+                .unwrap()
+                .source_description
+                .contains("Triangle")
+        );
+        app.images[0].path = path.clone();
+
+        app.configuration_path = dir.join("experiment.json").display().to_string();
+        app.save_applied_configuration();
+        assert!(app.configuration_error.is_none());
+        app.saved_configuration = None;
+        app.load_configuration();
+        assert_eq!(
+            app.saved_configuration.as_ref().unwrap().downsampling,
+            DownsamplingMethod::Triangle
+        );
+        app.apply_saved_configuration(&ctx);
+        finish(&mut app);
+        assert_eq!(app.applied_downsampling, DownsamplingMethod::Triangle);
+
+        app.reset_image_augmentations(&ctx);
+        assert_eq!(app.downsampling, DownsamplingMethod::Triangle);
+        assert_eq!(
+            app.applied_experiment_configuration().downsampling,
+            DownsamplingMethod::Triangle
+        );
+        let next_path = dir.join("next.png");
+        fs::copy(&path, &next_path).unwrap();
+        app.add_image_paths(vec![next_path]);
+        assert_eq!(app.selected_image, Some(1));
+        assert_eq!(app.downsampling, DownsamplingMethod::Triangle);
+        app.ensure_selected_image_loaded(&ctx);
+        finish(&mut app);
+        assert!(
+            app.histogram
+                .as_ref()
+                .unwrap()
+                .source_description
+                .contains("Triangle")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn histogram_bin_count_is_staged_until_committed() {

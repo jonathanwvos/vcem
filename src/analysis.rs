@@ -1,11 +1,13 @@
 use std::{fs::File, io::BufReader, path::Path};
 
 use eframe::egui::{ColorImage, Vec2};
-use image::{DynamicImage, imageops::FilterType};
+use image::DynamicImage;
 use tiff::{
     ColorType,
     decoder::{Decoder, DecodingResult},
 };
+
+use crate::downsampling::resize_preview;
 
 use crate::automata::{AutomataSimulationResult, CellularAutomataResult, simulate_legacy};
 use crate::automata_projection::{
@@ -17,8 +19,8 @@ use crate::quantization::{
     QuantizedHistogram, QuantizedIntensities,
 };
 use crate::types::{
-    CellularAutomataSettings, DenoiseMethod, DenoiseSettings, ExperimentConfiguration,
-    ImageRotation, IntensityHistogram, ProcessedImage,
+    CellularAutomataSettings, DenoiseMethod, DenoiseSettings, DownsamplingMethod,
+    ExperimentConfiguration, ImageRotation, IntensityHistogram, ProcessedImage,
 };
 
 const MAX_PREVIEW_PIXELS: u64 = 1_048_576;
@@ -27,7 +29,7 @@ pub fn intensity_histogram_from_path(
     path: &Path,
     bin_count: usize,
 ) -> std::result::Result<IntensityHistogram, String> {
-    let plane = decode_gray_plane(path)?;
+    let plane = decode_gray_plane(path, DownsamplingMethod::default())?;
     let quantizer = compile_normal_histogram_quantizer(plane.calibration, bin_count)?;
     let histogram = quantizer.histogram(&plane.values)?;
     Ok(histogram_from_counts(histogram, &plane.source_description))
@@ -50,7 +52,7 @@ pub fn processed_image_from_path(
     path: &Path,
     configuration: &ExperimentConfiguration,
 ) -> std::result::Result<ProcessedImage, String> {
-    let mut plane = decode_gray_plane(path)?;
+    let mut plane = decode_gray_plane(path, configuration.downsampling)?;
     if plane.calibration.minimum != 0 {
         return Err(
             "The current image-processing pipeline requires zero-based encoded intensities."
@@ -172,16 +174,22 @@ fn rotate_gray_plane(plane: &mut GrayPlane, rotation: ImageRotation) {
     plane.alpha = alpha;
 }
 
-fn decode_gray_plane(path: &Path) -> std::result::Result<GrayPlane, String> {
-    match decode_gray_plane_with_image(path) {
+fn decode_gray_plane(
+    path: &Path,
+    method: DownsamplingMethod,
+) -> std::result::Result<GrayPlane, String> {
+    match decode_gray_plane_with_image(path, method) {
         Ok(plane) => Ok(plane),
-        Err(image_error) if is_tiff_path(path) => decode_float_tiff_gray_plane(path)
+        Err(image_error) if is_tiff_path(path) => decode_float_tiff_gray_plane(path, method)
             .map_err(|tiff_error| format!("{image_error}; TIFF fallback failed: {tiff_error}")),
         Err(image_error) => Err(image_error),
     }
 }
 
-fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, String> {
+fn decode_gray_plane_with_image(
+    path: &Path,
+    method: DownsamplingMethod,
+) -> std::result::Result<GrayPlane, String> {
     let image = image::ImageReader::open(path)
         .map_err(|error| format!("Could not open {}: {}", path.display(), error))?
         .with_guessed_format()
@@ -189,14 +197,15 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
         .decode()
         .map_err(|error| format!("Could not decode {}: {}", path.display(), error))?;
 
-    Ok(match image {
+    let method = method.resolved(false);
+    let plane = match image {
         DynamicImage::ImageLuma8(image) => {
             let source_width = image.width();
             let source_height = image.height();
             let (preview_width, preview_height, resized) =
                 preview_dimensions(source_width, source_height);
             let image = if resized {
-                image::imageops::resize(&image, preview_width, preview_height, FilterType::Triangle)
+                resize_preview(&image, preview_width, preview_height, method)
             } else {
                 image
             };
@@ -215,6 +224,7 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
                     source_height,
                     image.width(),
                     image.height(),
+                    method,
                 ),
             }
         }
@@ -224,7 +234,7 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
             let (preview_width, preview_height, resized) =
                 preview_dimensions(source_width, source_height);
             let image = if resized {
-                image::imageops::resize(&image, preview_width, preview_height, FilterType::Triangle)
+                resize_preview(&image, preview_width, preview_height, method)
             } else {
                 image
             };
@@ -249,6 +259,7 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
                     source_height,
                     image.width(),
                     image.height(),
+                    method,
                 ),
             }
         }
@@ -258,7 +269,7 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
             let (preview_width, preview_height, resized) =
                 preview_dimensions(source_width, source_height);
             let image = if resized {
-                image::imageops::resize(&image, preview_width, preview_height, FilterType::Triangle)
+                resize_preview(&image, preview_width, preview_height, method)
             } else {
                 image
             };
@@ -277,6 +288,7 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
                     source_height,
                     image.width(),
                     image.height(),
+                    method,
                 ),
             }
         }
@@ -286,7 +298,7 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
             let (preview_width, preview_height, resized) =
                 preview_dimensions(source_width, source_height);
             let image = if resized {
-                image::imageops::resize(&image, preview_width, preview_height, FilterType::Triangle)
+                resize_preview(&image, preview_width, preview_height, method)
             } else {
                 image
             };
@@ -311,6 +323,7 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
                     source_height,
                     image.width(),
                     image.height(),
+                    method,
                 ),
             }
         }
@@ -321,7 +334,7 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
             let (preview_width, preview_height, resized) =
                 preview_dimensions(source_width, source_height);
             let image = if resized {
-                image::imageops::resize(&image, preview_width, preview_height, FilterType::Triangle)
+                resize_preview(&image, preview_width, preview_height, method)
             } else {
                 image
             };
@@ -340,13 +353,18 @@ fn decode_gray_plane_with_image(path: &Path) -> std::result::Result<GrayPlane, S
                     source_height,
                     image.width(),
                     image.height(),
+                    method,
                 ),
             }
         }
-    })
+    };
+    Ok(plane)
 }
 
-fn decode_float_tiff_gray_plane(path: &Path) -> std::result::Result<GrayPlane, String> {
+fn decode_float_tiff_gray_plane(
+    path: &Path,
+    method: DownsamplingMethod,
+) -> std::result::Result<GrayPlane, String> {
     let file = File::open(path)
         .map_err(|error| format!("Could not open {}: {}", path.display(), error))?;
     let mut decoder = Decoder::new(BufReader::new(file))
@@ -367,12 +385,14 @@ fn decode_float_tiff_gray_plane(path: &Path) -> std::result::Result<GrayPlane, S
             source_width,
             source_height,
             "32-bit float grayscale",
+            method,
         ),
         (ColorType::Gray(64), DecodingResult::F64(values)) => float_values_to_gray_plane(
             values.into_iter().map(|value| value as f32).collect(),
             source_width,
             source_height,
             "64-bit float grayscale",
+            method,
         ),
         (color_type, image) => Err(format!(
             "Unsupported TIFF fallback type: color {color_type:?}, data {}",
@@ -386,6 +406,7 @@ fn float_values_to_gray_plane(
     source_width: u32,
     source_height: u32,
     base_description: &str,
+    method: DownsamplingMethod,
 ) -> std::result::Result<GrayPlane, String> {
     let expected_len = source_width as usize * source_height as usize;
     if values.len() != expected_len {
@@ -422,20 +443,28 @@ fn float_values_to_gray_plane(
         })
         .collect::<Vec<_>>();
 
+    let method = method.resolved(true);
     let (preview_width, preview_height, resized) = preview_dimensions(source_width, source_height);
     if resized {
-        normalized_values = resize_gray_nearest(
-            &normalized_values,
-            source_width as usize,
-            source_height as usize,
-            preview_width as usize,
-            preview_height as usize,
-        );
+        let image = image::ImageBuffer::<image::Luma<u16>, _>::from_raw(
+            source_width,
+            source_height,
+            normalized_values
+                .into_iter()
+                .map(|value| value as u16)
+                .collect::<Vec<_>>(),
+        )
+        .ok_or_else(|| "Invalid float TIFF dimensions".to_owned())?;
+        normalized_values = resize_preview(&image, preview_width, preview_height, method)
+            .into_raw()
+            .into_iter()
+            .map(u32::from)
+            .collect();
     }
 
     let width = preview_width as usize;
     let height = preview_height as usize;
-    Ok(GrayPlane {
+    let plane = GrayPlane {
         width,
         height,
         values: normalized_values,
@@ -449,11 +478,13 @@ fn float_values_to_gray_plane(
                 source_height,
                 preview_width,
                 preview_height,
+                method,
             ),
             finite_min,
             finite_max
         ),
-    })
+    };
+    Ok(plane)
 }
 
 fn preview_dimensions(width: u32, height: u32) -> (u32, u32, bool) {
@@ -475,32 +506,19 @@ fn preview_description(
     source_height: u32,
     preview_width: u32,
     preview_height: u32,
+    method: DownsamplingMethod,
 ) -> String {
     if source_width == preview_width && source_height == preview_height {
-        base_description.to_owned()
+        format!(
+            "{base_description}; no downsampling needed ({})",
+            method.label()
+        )
     } else {
         format!(
-            "{base_description} preview {preview_width} x {preview_height} from {source_width} x {source_height}"
+            "{base_description} preview {preview_width} x {preview_height} from {source_width} x {source_height}; downsampling: {}",
+            method.label()
         )
     }
-}
-
-fn resize_gray_nearest(
-    values: &[u32],
-    source_width: usize,
-    source_height: usize,
-    preview_width: usize,
-    preview_height: usize,
-) -> Vec<u32> {
-    let mut output = Vec::with_capacity(preview_width * preview_height);
-    for y in 0..preview_height {
-        let source_y = (y * source_height / preview_height).min(source_height - 1);
-        for x in 0..preview_width {
-            let source_x = (x * source_width / preview_width).min(source_width - 1);
-            output.push(values[source_y * source_width + source_x]);
-        }
-    }
-    output
 }
 
 fn is_tiff_path(path: &Path) -> bool {
@@ -848,6 +866,122 @@ mod tests {
     use super::*;
 
     #[test]
+    fn downsampling_reaches_float_tiff_histogram_and_ca_inputs() {
+        // The 2:1 reduction must average both checkerboard values, while legacy
+        // nearest picks only zeroes. Exercise the real TIFF decoder and pipeline.
+        let path = std::env::temp_dir().join(format!(
+            "vcem-downsampling-float-{}.tif",
+            std::process::id()
+        ));
+        let values = (0..2048 * 2048)
+            .map(|i| ((i / 2048 + i % 2048) % 2) as f32)
+            .collect::<Vec<_>>();
+        {
+            let mut file = File::create(&path).unwrap();
+            let mut encoder = tiff::encoder::TiffEncoder::new(&mut file).unwrap();
+            encoder
+                .write_image::<tiff::encoder::colortype::Gray32Float>(2048, 2048, &values)
+                .unwrap();
+        }
+        let settings = CellularAutomataSettings {
+            kernel_size: 3,
+            kernel: vec![1.0; 9],
+            iterations: 1,
+            ..Default::default()
+        };
+        for method in [
+            DownsamplingMethod::Legacy,
+            DownsamplingMethod::Nearest,
+            DownsamplingMethod::AreaAverage,
+            DownsamplingMethod::Triangle,
+        ] {
+            let configuration = ExperimentConfiguration {
+                downsampling: method,
+                cellular_automata: Some(settings.clone()),
+                ..Default::default()
+            };
+            let result = processed_image_from_path(&path, &configuration).unwrap();
+            assert_eq!(result.size, Vec2::new(1024.0, 1024.0));
+            let resolved = method.resolved(true);
+            assert!(
+                result
+                    .histogram
+                    .source_description
+                    .contains(resolved.label())
+            );
+            if matches!(
+                resolved,
+                DownsamplingMethod::Nearest | DownsamplingMethod::AreaAverage
+            ) {
+                let value = if resolved == DownsamplingMethod::Nearest {
+                    0
+                } else {
+                    32768
+                };
+                assert!(result.prepared_values.iter().all(|pixel| *pixel == value));
+                assert_eq!(result.histogram.min_value, value);
+                assert_eq!(result.histogram.max_value, value);
+            }
+            let expected = simulate_legacy(&result.prepared_values, 1024, 1024, &settings).unwrap();
+            assert_eq!(
+                result.cellular_automata_result.unwrap().state,
+                expected.state
+            );
+            assert_eq!(result.histogram.bins.iter().sum::<u64>(), 1024 * 1024);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn downsampling_keeps_small_float_images_unchanged() {
+        for method in [
+            DownsamplingMethod::Legacy,
+            DownsamplingMethod::Nearest,
+            DownsamplingMethod::AreaAverage,
+            DownsamplingMethod::Triangle,
+        ] {
+            let plane =
+                float_values_to_gray_plane(vec![0.0, 0.5, 1.0], 3, 1, "test", method).unwrap();
+            assert_eq!(plane.values, [0, 32768, 65535]);
+            assert!(plane.source_description.contains("no downsampling needed"));
+        }
+    }
+
+    #[test]
+    fn downsampling_preserves_legacy_integer_decoding_and_resamples_alpha() {
+        let path = std::env::temp_dir().join(format!(
+            "vcem-downsampling-alpha-{}.png",
+            std::process::id()
+        ));
+        let source = image::ImageBuffer::from_fn(2048, 2048, |x, y| {
+            let value = ((x + y) % 2 * 65535) as u16;
+            image::LumaA([value, 65535 - value])
+        });
+        source.save(&path).unwrap();
+        let area = decode_gray_plane(&path, DownsamplingMethod::AreaAverage).unwrap();
+        assert!(area.values.iter().all(|value| *value == 32768));
+        assert!(area.alpha.iter().all(|value| *value == 128));
+        let legacy = decode_gray_plane(&path, DownsamplingMethod::Legacy).unwrap();
+        let expected =
+            image::imageops::resize(&source, 1024, 1024, image::imageops::FilterType::Triangle);
+        assert_eq!(
+            legacy.values,
+            expected
+                .pixels()
+                .map(|pixel| u32::from(pixel.0[0]))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            legacy.alpha,
+            expected
+                .pixels()
+                .map(|pixel| (pixel.0[1] >> 8) as u8)
+                .collect::<Vec<_>>()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn equalizes_values_across_available_range() {
         let mut values = vec![10, 10, 20, 30];
 
@@ -941,11 +1075,27 @@ mod tests {
             return;
         }
 
-        let plane = decode_gray_plane(path).expect("float TIFF should decode through fallback");
+        let plane = decode_gray_plane(path, DownsamplingMethod::Legacy)
+            .expect("float TIFF should decode through fallback");
         assert_eq!((plane.width, plane.height), (1024, 1024));
         assert_eq!(plane.calibration.level_count(), 65_536);
         assert_eq!(plane.calibration.maximum_value(), 65_535);
         assert!(plane.source_description.contains("32-bit float grayscale"));
+        for method in [
+            DownsamplingMethod::Nearest,
+            DownsamplingMethod::AreaAverage,
+            DownsamplingMethod::Triangle,
+        ] {
+            let resized = decode_gray_plane(path, method).unwrap();
+            assert_eq!((resized.width, resized.height), (1024, 1024));
+            assert!(resized.source_description.contains(method.label()));
+            assert!(resized.values.iter().all(|value| *value <= 65535));
+            if method == DownsamplingMethod::Nearest {
+                assert_eq!(resized.values, plane.values);
+            } else {
+                assert_ne!(resized.values, plane.values);
+            }
+        }
     }
 
     #[test]
@@ -958,7 +1108,8 @@ mod tests {
             return;
         }
 
-        let plane = decode_gray_plane(path).expect("float TIFF should decode through fallback");
+        let plane = decode_gray_plane(path, DownsamplingMethod::Legacy)
+            .expect("float TIFF should decode through fallback");
         let result = simulate_legacy(
             &plane.values,
             plane.width,

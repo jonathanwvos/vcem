@@ -80,6 +80,8 @@ impl ImageRotation {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExperimentConfiguration {
     pub schema_version: u32,
+    #[serde(default = "DownsamplingMethod::legacy")]
+    pub downsampling: DownsamplingMethod,
     pub histogram_bin_count: usize,
     pub rotation: ImageRotation,
     pub denoise: Option<DenoiseSettings>,
@@ -93,6 +95,7 @@ impl Default for ExperimentConfiguration {
     fn default() -> Self {
         Self {
             schema_version: 1,
+            downsampling: DownsamplingMethod::default(),
             histogram_bin_count: 256,
             rotation: ImageRotation::None,
             denoise: None,
@@ -100,6 +103,40 @@ impl Default for ExperimentConfiguration {
             equalization: None,
             gamma: None,
             cellular_automata: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownsamplingMethod {
+    /// Reproduce configurations saved before downsampling was selectable.
+    Legacy,
+    Nearest,
+    #[default]
+    AreaAverage,
+    Triangle,
+}
+
+impl DownsamplingMethod {
+    pub fn legacy() -> Self {
+        Self::Legacy
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "Original behavior (legacy)",
+            Self::Nearest => "Nearest neighbor",
+            Self::AreaAverage => "Area average",
+            Self::Triangle => "Triangle (bilinear)",
+        }
+    }
+
+    pub fn resolved(self, float_tiff: bool) -> Self {
+        match self {
+            Self::Legacy if float_tiff => Self::Nearest,
+            Self::Legacy => Self::Triangle,
+            method => method,
         }
     }
 }
@@ -119,9 +156,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn downsampling_defaults_and_saved_configurations_are_compatible() {
+        let configuration = ExperimentConfiguration::default();
+        assert_eq!(configuration.downsampling, DownsamplingMethod::AreaAverage);
+        let mut old_json = serde_json::to_value(&configuration).unwrap();
+        old_json.as_object_mut().unwrap().remove("downsampling");
+        let legacy: ExperimentConfiguration = serde_json::from_value(old_json.clone()).unwrap();
+        assert_eq!(legacy.downsampling, DownsamplingMethod::Legacy);
+        assert_eq!(
+            legacy.downsampling.resolved(true),
+            DownsamplingMethod::Nearest
+        );
+        assert_eq!(
+            legacy.downsampling.resolved(false),
+            DownsamplingMethod::Triangle
+        );
+
+        for method in [
+            DownsamplingMethod::Legacy,
+            DownsamplingMethod::Nearest,
+            DownsamplingMethod::AreaAverage,
+            DownsamplingMethod::Triangle,
+        ] {
+            let configuration = ExperimentConfiguration {
+                downsampling: method,
+                ..configuration.clone()
+            };
+            let json = serde_json::to_string(&configuration).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ExperimentConfiguration>(&json).unwrap(),
+                configuration
+            );
+        }
+        old_json["downsampling"] = serde_json::json!("unknown_filter");
+        assert!(serde_json::from_value::<ExperimentConfiguration>(old_json).is_err());
+    }
+
+    #[test]
     fn experiment_configuration_round_trips_through_json() {
         let configuration = ExperimentConfiguration {
             schema_version: 1,
+            downsampling: DownsamplingMethod::Triangle,
             histogram_bin_count: 512,
             rotation: ImageRotation::HalfTurn,
             denoise: Some(DenoiseSettings {
