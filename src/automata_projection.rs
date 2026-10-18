@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, fmt, mem::size_of};
 use crate::{
     automata::AutomataSimulationResult,
     continuous_automata::{CONTINUOUS_RESULT_VERSION, ContinuousDomain},
-    discrete_automata::{DISCRETE_RESULT_VERSION, StateStorage},
+    discrete_automata::{CompactState, DISCRETE_RESULT_VERSION, StateStorage},
 };
 
 pub const OUTPUT_PROJECTION_VERSION: u32 = 1;
@@ -382,6 +382,111 @@ pub fn project_continuous_state_overlay(
     })
 }
 
+/// Projects a borrowed discrete state without constructing or cloning a
+/// persisted simulation result. This mirrors
+/// [`project_continuous_state_overlay`] for interactive discrete playback.
+pub fn project_discrete_state_overlay(
+    state: &CompactState,
+    size: [usize; 2],
+    state_count: u32,
+    spec: &OverlayProjectionSpec,
+    limits: ProjectionLimits,
+) -> Result<RgbaOverlay, ProjectionError> {
+    if spec.version != OUTPUT_PROJECTION_VERSION || spec.field.version != OUTPUT_PROJECTION_VERSION
+    {
+        return Err(ProjectionError::UnsupportedProjectionVersion {
+            found: if spec.version != OUTPUT_PROJECTION_VERSION {
+                spec.version
+            } else {
+                spec.field.version
+            },
+        });
+    }
+    validate_transfer(spec.field.transfer)?;
+    let expected_storage = StateStorage::for_state_count(state_count)
+        .map_err(|error| ProjectionError::InvalidResult(error.to_string()))?;
+    if state.storage() != expected_storage {
+        return Err(ProjectionError::InvalidResult(
+            "Discrete projection storage is not canonical for its state count.".to_owned(),
+        ));
+    }
+    let cell_count = size[0]
+        .checked_mul(size[1])
+        .filter(|count| *count > 0)
+        .ok_or_else(|| {
+            ProjectionError::InvalidResult(
+                "Discrete projection dimensions must be non-zero and addressable.".to_owned(),
+            )
+        })?;
+    if state.len() != cell_count {
+        return Err(ProjectionError::InvalidResult(format!(
+            "Discrete projection has {} values; expected {cell_count}.",
+            state.len()
+        )));
+    }
+    let membership = match &spec.field.source {
+        ProjectionSource::NormalizedFinalState => None,
+        ProjectionSource::DiscreteStateMembership { states } => {
+            let mut unique = BTreeSet::new();
+            for value in states {
+                if *value >= state_count {
+                    return Err(ProjectionError::DiscreteStateOutOfRange {
+                        state: *value,
+                        state_count,
+                    });
+                }
+                if !unique.insert(*value) {
+                    return Err(ProjectionError::DuplicateDiscreteState { state: *value });
+                }
+            }
+            Some(unique)
+        }
+    };
+    for index in 0..cell_count {
+        let value = state.get(index).unwrap();
+        if value >= state_count {
+            return Err(ProjectionError::InvalidResult(format!(
+                "Discrete projection state {value} at index {index} is outside state_count {state_count}."
+            )));
+        }
+    }
+    let rgba_len = cell_count
+        .checked_mul(4)
+        .ok_or(ProjectionError::SizeOverflow {
+            context: "RGBA overlay",
+        })?;
+    let required_bytes = u64::try_from(rgba_len).map_err(|_| ProjectionError::SizeOverflow {
+        context: "RGBA overlay",
+    })?;
+    enforce_budget("RGBA overlay", required_bytes, limits.max_output_bytes)?;
+    let mut rgba = try_vec_with_capacity(rgba_len, required_bytes, "RGBA overlay")?;
+    for index in 0..cell_count {
+        let value = state.get(index).unwrap();
+        let normalized = match &membership {
+            None => discrete_normalized_value(value, state_count),
+            Some(states) => discrete_membership_value(value, states),
+        };
+        let projected = apply_transfer(normalized, spec.field.transfer);
+        let alpha = (projected * spec.maximum_alpha as f32)
+            .round()
+            .clamp(0.0, spec.maximum_alpha as f32) as u8;
+        rgba.extend_from_slice(&[spec.color[0], spec.color[1], spec.color[2], alpha]);
+    }
+    Ok(RgbaOverlay {
+        version: PROJECTED_FIELD_VERSION,
+        size,
+        rgba,
+    })
+}
+
+fn discrete_normalized_value(state: u32, state_count: u32) -> f32 {
+    state as f32 / (state_count - 1) as f32
+}
+
+fn discrete_membership_value(state: u32, states: &BTreeSet<u32>) -> f32 {
+    f32::from(states.contains(&state))
+}
+
 struct ValidatedProjection<'a> {
     result: &'a AutomataSimulationResult,
     source: ValidatedSource,
@@ -460,10 +565,12 @@ impl<'a> ValidatedProjection<'a> {
                 AutomataSimulationResult::DiscreteMapV1(result),
                 ValidatedSource::NormalizedFinalState,
             ) => {
-                let denominator = (result.state_count - 1) as f32;
                 for index in 0..result.final_state.len() {
-                    let normalized = result.final_state.get(index).unwrap() as f32 / denominator;
-                    visitor(apply_transfer(normalized, self.transfer));
+                    let state = result.final_state.get(index).unwrap();
+                    visitor(apply_transfer(
+                        discrete_normalized_value(state, result.state_count),
+                        self.transfer,
+                    ));
                 }
             }
             (
@@ -471,8 +578,11 @@ impl<'a> ValidatedProjection<'a> {
                 ValidatedSource::DiscreteStateMembership(states),
             ) => {
                 for index in 0..result.final_state.len() {
-                    let selected = states.contains(&result.final_state.get(index).unwrap());
-                    visitor(apply_transfer(f32::from(selected), self.transfer));
+                    let state = result.final_state.get(index).unwrap();
+                    visitor(apply_transfer(
+                        discrete_membership_value(state, states),
+                        self.transfer,
+                    ));
                 }
             }
             _ => unreachable!("projection source and result were validated together"),
@@ -799,6 +909,104 @@ mod tests {
         .unwrap();
 
         assert_eq!(borrowed, persisted);
+    }
+
+    #[test]
+    fn borrowed_discrete_overlay_matches_a_persisted_result_projection() {
+        let values = vec![0_u8, 1, 2];
+        let state = CompactState::U8(values.clone());
+        let specification = OverlayProjectionSpec {
+            version: OUTPUT_PROJECTION_VERSION,
+            field: NumericProjectionSpec {
+                version: OUTPUT_PROJECTION_VERSION,
+                source: ProjectionSource::NormalizedFinalState,
+                transfer: ProjectionTransfer::Power { exponent: 0.5 },
+            },
+            color: [48, 221, 255],
+            maximum_alpha: 224,
+        };
+
+        let borrowed = project_discrete_state_overlay(
+            &state,
+            [values.len(), 1],
+            3,
+            &specification,
+            ProjectionLimits::default(),
+        )
+        .unwrap();
+        let persisted = project_rgba_overlay(
+            &discrete_result(values, 3),
+            &specification,
+            ProjectionLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(borrowed, persisted);
+    }
+
+    #[test]
+    fn borrowed_discrete_membership_overlay_matches_a_persisted_result_projection() {
+        let values = vec![0_u8, 2, 1, 2];
+        let state = CompactState::U8(values.clone());
+        let specification = OverlayProjectionSpec {
+            version: OUTPUT_PROJECTION_VERSION,
+            field: NumericProjectionSpec {
+                version: OUTPUT_PROJECTION_VERSION,
+                source: ProjectionSource::DiscreteStateMembership { states: vec![2] },
+                transfer: ProjectionTransfer::Identity,
+            },
+            color: [10, 20, 30],
+            maximum_alpha: 255,
+        };
+
+        let borrowed = project_discrete_state_overlay(
+            &state,
+            [values.len(), 1],
+            3,
+            &specification,
+            ProjectionLimits::default(),
+        )
+        .unwrap();
+        let persisted = project_rgba_overlay(
+            &discrete_result(values, 3),
+            &specification,
+            ProjectionLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(borrowed, persisted);
+    }
+
+    #[test]
+    fn discrete_state_overlay_rejects_size_and_range_mismatches() {
+        let state = CompactState::U8(vec![0, 1, 2]);
+        let specification = OverlayProjectionSpec {
+            version: OUTPUT_PROJECTION_VERSION,
+            field: NumericProjectionSpec::normalized_final_state(),
+            color: [0, 0, 0],
+            maximum_alpha: 255,
+        };
+        assert!(matches!(
+            project_discrete_state_overlay(
+                &state,
+                [2, 1],
+                3,
+                &specification,
+                ProjectionLimits::default(),
+            ),
+            Err(ProjectionError::InvalidResult(_))
+        ));
+        let out_of_range = CompactState::U8(vec![0, 1, 5]);
+        assert!(matches!(
+            project_discrete_state_overlay(
+                &out_of_range,
+                [3, 1],
+                3,
+                &specification,
+                ProjectionLimits::default(),
+            ),
+            Err(ProjectionError::InvalidResult(_))
+        ));
     }
 
     #[test]

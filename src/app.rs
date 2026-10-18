@@ -20,16 +20,21 @@ use std::{
 };
 
 use crate::analysis::processed_image_from_path;
-use crate::automata::AutomataCompileLimits;
+use crate::automata::{AutomataCompileLimits, AutomataModelDefinition, AutomataProgramDocument};
 use crate::automata_lab::{
-    AutomataLabSession, LabCapturePolicy, LabDiagnostics, LabExecutionPolicy, LabStepOutcome,
-    LeniaLabSettings,
+    AutomataLabSession, DiscreteLabSettings, LabCapturePolicy, LabDiagnostics, LabExecutionPolicy,
+    LabStateSnapshot, LabStepOutcome, LeniaLabSettings, resized_table,
 };
 use crate::automata_projection::{
     NumericProjectionSpec, OUTPUT_PROJECTION_VERSION, OverlayProjectionSpec, ProjectionLimits,
     ProjectionSource, ProjectionTransfer, project_continuous_state_overlay,
+    project_discrete_state_overlay,
 };
 use crate::continuous_automata::{ContinuousBoundaryPolicy, ContinuousDomain};
+use crate::discrete_automata::{
+    AggregateReducer, BoundaryPolicy, DiscreteRuleKind, KernelOffset, PresenceReduction,
+    PresenceTransition,
+};
 use crate::types::{
     CellularAutomataResponse, CellularAutomataSeedMode, CellularAutomataSettings, DenoiseMethod,
     DenoiseSettings, DisplayedImage, DownsamplingMethod, ExperimentConfiguration, ImageFile,
@@ -85,10 +90,17 @@ pub struct VCEMApp {
     processing_job: Option<ProcessingJob>,
     next_processing_job_id: u64,
     automata_lab_settings: LeniaLabSettings,
+    automata_lab_discrete_settings: DiscreteLabSettings,
+    automata_lab_model_family: LabModelFamily,
+    automata_lab_kernel_grid_size: u32,
+    automata_lab_kernel_drag_include: Option<bool>,
+    automata_lab_presence_draft_trigger: u32,
+    automata_lab_presence_draft_output: u32,
     automata_lab_execution_policy: LabExecutionPolicy,
     automata_lab_capture_policy: LabCapturePolicy,
     automata_lab_session: Option<AutomataLabSession>,
     automata_lab_job: Option<AutomataLabJob>,
+    automata_lab_step_progress: Option<(u32, u32)>,
     automata_lab_texture: Option<egui::TextureHandle>,
     automata_lab_playing: bool,
     automata_lab_steps_per_second: f32,
@@ -114,9 +126,34 @@ struct ProcessingJob {
 }
 
 struct AutomataLabJob {
-    receiver: Receiver<Result<(AutomataLabSession, LabStepOutcome), String>>,
+    receiver: Receiver<AutomataLabStepUpdate>,
     cancellation: Arc<AtomicBool>,
     discard_result: bool,
+}
+
+/// The step worker reports one generation at a time so the overlay can
+/// animate live and the UI can show real progress, instead of a single
+/// request/spinner/result round trip for a multi-cycle step.
+///
+/// `Progress` carries only a cheap state snapshot, not a full session clone:
+/// `AutomataLabSession::checkpoints`/`bookmarks` are not Arc-wrapped, so
+/// cloning the whole session on every single generation (rather than once
+/// per UI-level step) made its cost grow with total checkpoint history,
+/// which grows unboundedly over a long Play session. Only `Done` clones the
+/// full session, once per step call.
+enum AutomataLabStepUpdate {
+    Progress {
+        state: LabStateSnapshot,
+        generation: u32,
+        diagnostics: Option<LabDiagnostics>,
+        cycles_completed: u32,
+        cycles_total: u32,
+    },
+    Done {
+        session: Box<AutomataLabSession>,
+        outcome: LabStepOutcome,
+    },
+    Failed(String),
 }
 
 struct ProcessingResult {
@@ -170,6 +207,20 @@ enum ViewMode {
     Segment,
     Measure,
     AutomataLab,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LabModelFamily {
+    Discrete,
+    Continuous,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscreteTableTarget {
+    Direct,
+    Aggregate,
+    Ordered,
+    PresenceFallback,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,10 +317,17 @@ impl VCEMApp {
             processing_job: None,
             next_processing_job_id: 1,
             automata_lab_settings: LeniaLabSettings::default(),
+            automata_lab_discrete_settings: DiscreteLabSettings::default(),
+            automata_lab_model_family: LabModelFamily::Continuous,
+            automata_lab_kernel_grid_size: 3,
+            automata_lab_kernel_drag_include: None,
+            automata_lab_presence_draft_trigger: 0,
+            automata_lab_presence_draft_output: 0,
             automata_lab_execution_policy: LabExecutionPolicy::default(),
             automata_lab_capture_policy: LabCapturePolicy::default(),
             automata_lab_session: None,
             automata_lab_job: None,
+            automata_lab_step_progress: None,
             automata_lab_texture: None,
             automata_lab_playing: false,
             automata_lab_steps_per_second: 10.0,
@@ -1060,6 +1118,412 @@ impl VCEMApp {
         });
     }
 
+    fn show_continuous_lab_controls(&mut self, ui: &mut Ui) {
+        ui.collapsing("Kernel", |ui| {
+            ui.add(
+                egui::Slider::new(&mut self.automata_lab_settings.kernel_size, 1..=31)
+                    .step_by(2.0)
+                    .text("Size"),
+            );
+            if self.automata_lab_settings.kernel_size.is_multiple_of(2) {
+                self.automata_lab_settings.kernel_size =
+                    (self.automata_lab_settings.kernel_size + 1).min(31);
+            }
+            ui.add(
+                egui::Slider::new(
+                    &mut self.automata_lab_settings.kernel_ring_center,
+                    0.0..=1.5,
+                )
+                .text("Ring centre"),
+            );
+            ui.add(
+                egui::Slider::new(
+                    &mut self.automata_lab_settings.kernel_ring_width,
+                    0.01..=0.75,
+                )
+                .text("Ring width"),
+            );
+            let boundary_label = match self.automata_lab_settings.boundary {
+                ContinuousBoundaryPolicy::Clamp => "Clamp",
+                ContinuousBoundaryPolicy::Reflect => "Reflect",
+                ContinuousBoundaryPolicy::Wrap => "Wrap",
+                ContinuousBoundaryPolicy::Constant { .. } => "Constant zero",
+            };
+            egui::ComboBox::from_label("Boundary")
+                .selected_text(boundary_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.automata_lab_settings.boundary,
+                        ContinuousBoundaryPolicy::Clamp,
+                        "Clamp",
+                    );
+                    ui.selectable_value(
+                        &mut self.automata_lab_settings.boundary,
+                        ContinuousBoundaryPolicy::Reflect,
+                        "Reflect",
+                    );
+                    ui.selectable_value(
+                        &mut self.automata_lab_settings.boundary,
+                        ContinuousBoundaryPolicy::Wrap,
+                        "Wrap",
+                    );
+                    ui.selectable_value(
+                        &mut self.automata_lab_settings.boundary,
+                        ContinuousBoundaryPolicy::Constant { value: 0.0 },
+                        "Constant zero",
+                    );
+                });
+        });
+
+        ui.collapsing("Growth", |ui| {
+            ui.add(
+                egui::Slider::new(&mut self.automata_lab_settings.growth_center, -0.5..=1.5)
+                    .text("Centre"),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.automata_lab_settings.growth_width, 0.005..=0.5)
+                    .text("Width"),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.automata_lab_settings.time_step, 0.001..=0.5)
+                    .logarithmic(true)
+                    .text("Time step"),
+            );
+        });
+    }
+
+    /// Keeps the active rule's dense table at the length its current
+    /// state/kernel/reducer configuration requires, so the table editor
+    /// never renders against a stale length.
+    fn sync_discrete_table_lengths(&mut self) {
+        let Ok(expected) = self.automata_lab_discrete_settings.expected_table_len() else {
+            return;
+        };
+        let settings = &mut self.automata_lab_discrete_settings;
+        let table = match settings.rule_kind {
+            DiscreteRuleKind::Direct => &mut settings.direct_table,
+            DiscreteRuleKind::Aggregate => &mut settings.aggregate_table,
+            DiscreteRuleKind::OrderedNeighborhood => &mut settings.ordered_table,
+            DiscreteRuleKind::PresenceTriggered => &mut settings.presence_fallback,
+        };
+        if table.len() != expected {
+            *table = resized_table(std::mem::take(table), expected, 0);
+        }
+    }
+
+    fn show_discrete_lab_controls(&mut self, ui: &mut Ui) {
+        self.sync_discrete_table_lengths();
+        ui.collapsing("State & Kernel", |ui| {
+            ui.add(
+                egui::Slider::new(&mut self.automata_lab_discrete_settings.state_count, 2..=64)
+                    .text("State count"),
+            );
+            self.show_discrete_kernel_grid(ui);
+            let boundary_label = match self.automata_lab_discrete_settings.boundary {
+                BoundaryPolicy::Clamp => "Clamp",
+                BoundaryPolicy::Reflect => "Reflect",
+                BoundaryPolicy::Wrap => "Wrap",
+                BoundaryPolicy::Constant(_) => "Constant",
+            };
+            egui::ComboBox::from_label("Boundary")
+                .selected_text(boundary_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.automata_lab_discrete_settings.boundary,
+                        BoundaryPolicy::Clamp,
+                        "Clamp",
+                    );
+                    ui.selectable_value(
+                        &mut self.automata_lab_discrete_settings.boundary,
+                        BoundaryPolicy::Reflect,
+                        "Reflect",
+                    );
+                    ui.selectable_value(
+                        &mut self.automata_lab_discrete_settings.boundary,
+                        BoundaryPolicy::Wrap,
+                        "Wrap",
+                    );
+                    ui.selectable_value(
+                        &mut self.automata_lab_discrete_settings.boundary,
+                        BoundaryPolicy::Constant(0),
+                        "Constant",
+                    );
+                });
+            if let BoundaryPolicy::Constant(value) =
+                &mut self.automata_lab_discrete_settings.boundary
+            {
+                let max_state = self
+                    .automata_lab_discrete_settings
+                    .state_count
+                    .saturating_sub(1);
+                ui.add(
+                    DragValue::new(value)
+                        .range(0..=max_state)
+                        .prefix("Constant state: "),
+                );
+            }
+        });
+
+        ui.collapsing("Rule", |ui| {
+            self.show_discrete_rule_controls(ui);
+        });
+    }
+
+    fn show_discrete_kernel_grid(&mut self, ui: &mut Ui) {
+        let old_size = self.automata_lab_kernel_grid_size;
+        let mut new_size = old_size;
+        egui::ComboBox::from_label("Kernel grid")
+            .selected_text(format!("{old_size} x {old_size}"))
+            .show_ui(ui, |ui| {
+                for size in (3..=15).step_by(2) {
+                    ui.selectable_value(&mut new_size, size, format!("{size} x {size}"));
+                }
+            });
+        if new_size != old_size {
+            self.automata_lab_kernel_grid_size = new_size;
+        }
+
+        let side = self.automata_lab_kernel_grid_size;
+        let half = (side / 2) as i32;
+        let mut included: Vec<bool> = (0..side * side)
+            .map(|index| {
+                let x = (index % side) as i32 - half;
+                let y = (index / side) as i32 - half;
+                self.automata_lab_discrete_settings
+                    .kernel
+                    .contains(&KernelOffset::new(x, y))
+            })
+            .collect();
+
+        let cell_size = (ui.available_width() / side as f32 - 2.0).clamp(12.0, 24.0);
+        let primary_down = ui.input(|input| input.pointer.button_down(PointerButton::Primary));
+        if !primary_down {
+            self.automata_lab_kernel_drag_include = None;
+        }
+        let pointer_pos = ui.input(|input| input.pointer.latest_pos());
+        let mut changed = false;
+
+        ui.vertical(|ui| {
+            for y in 0..side {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for x in 0..side {
+                        let index = (y * side + x) as usize;
+                        let label = if included[index] { "x" } else { "" };
+                        let response = ui
+                            .add_sized(
+                                [cell_size, cell_size],
+                                Button::new(label).sense(Sense::click_and_drag()),
+                            )
+                            .on_hover_text(
+                                "Click toggles this kernel offset. Drag paints from the starting cell's toggled state.",
+                            );
+
+                        if response.clicked_by(PointerButton::Primary) {
+                            included[index] = !included[index];
+                            changed = true;
+                        }
+                        if response.drag_started_by(PointerButton::Primary) {
+                            let brush = !included[index];
+                            self.automata_lab_kernel_drag_include = Some(brush);
+                            included[index] = brush;
+                            changed = true;
+                        }
+                        if primary_down
+                            && pointer_pos.is_some_and(|pos| response.rect.contains(pos))
+                            && let Some(brush) = self.automata_lab_kernel_drag_include
+                        {
+                            included[index] = brush;
+                            changed = true;
+                        }
+                    }
+                });
+            }
+        });
+
+        if changed {
+            self.automata_lab_discrete_settings.kernel = kernel_offsets_from_grid(&included, side);
+        }
+    }
+
+    fn show_discrete_rule_controls(&mut self, ui: &mut Ui) {
+        let old_kind = self.automata_lab_discrete_settings.rule_kind;
+        egui::ComboBox::from_label("Rule kind")
+            .selected_text(discrete_rule_kind_label(old_kind))
+            .show_ui(ui, |ui| {
+                for kind in [
+                    DiscreteRuleKind::Direct,
+                    DiscreteRuleKind::Aggregate,
+                    DiscreteRuleKind::OrderedNeighborhood,
+                    DiscreteRuleKind::PresenceTriggered,
+                ] {
+                    ui.selectable_value(
+                        &mut self.automata_lab_discrete_settings.rule_kind,
+                        kind,
+                        discrete_rule_kind_label(kind),
+                    );
+                }
+            });
+        if self.automata_lab_discrete_settings.rule_kind != old_kind {
+            self.sync_discrete_table_lengths();
+        }
+
+        match self.automata_lab_discrete_settings.rule_kind {
+            DiscreteRuleKind::Direct => {
+                self.show_discrete_dense_table(ui, DiscreteTableTarget::Direct);
+            }
+            DiscreteRuleKind::Aggregate => {
+                let old_reducer = self.automata_lab_discrete_settings.aggregate_reducer;
+                let reducer_label = match old_reducer {
+                    AggregateReducer::RoundedMean => "Rounded mean",
+                    AggregateReducer::Sum => "Sum",
+                };
+                egui::ComboBox::from_label("Reducer")
+                    .selected_text(reducer_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.automata_lab_discrete_settings.aggregate_reducer,
+                            AggregateReducer::RoundedMean,
+                            "Rounded mean",
+                        );
+                        ui.selectable_value(
+                            &mut self.automata_lab_discrete_settings.aggregate_reducer,
+                            AggregateReducer::Sum,
+                            "Sum",
+                        );
+                    });
+                if self.automata_lab_discrete_settings.aggregate_reducer != old_reducer {
+                    self.sync_discrete_table_lengths();
+                }
+                self.show_discrete_dense_table(ui, DiscreteTableTarget::Aggregate);
+            }
+            DiscreteRuleKind::OrderedNeighborhood => {
+                self.show_discrete_dense_table(ui, DiscreteTableTarget::Ordered);
+            }
+            DiscreteRuleKind::PresenceTriggered => {
+                self.show_discrete_presence_controls(ui);
+            }
+        }
+    }
+
+    fn show_discrete_presence_controls(&mut self, ui: &mut Ui) {
+        let state_count = self.automata_lab_discrete_settings.state_count;
+        let max_state = state_count.saturating_sub(1);
+
+        let reduction_label = match self.automata_lab_discrete_settings.presence_reduction {
+            PresenceReduction::LowestTrigger => "Lowest trigger wins",
+            PresenceReduction::HighestTrigger => "Highest trigger wins",
+        };
+        egui::ComboBox::from_label("Reduction")
+            .selected_text(reduction_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.automata_lab_discrete_settings.presence_reduction,
+                    PresenceReduction::LowestTrigger,
+                    "Lowest trigger wins",
+                );
+                ui.selectable_value(
+                    &mut self.automata_lab_discrete_settings.presence_reduction,
+                    PresenceReduction::HighestTrigger,
+                    "Highest trigger wins",
+                );
+            });
+
+        ui.separator();
+        ui.label("Transitions");
+        let mut remove = None;
+        for (index, transition) in self
+            .automata_lab_discrete_settings
+            .presence_transitions
+            .iter_mut()
+            .enumerate()
+        {
+            ui.horizontal(|ui| {
+                ui.label("If present:");
+                ui.add(DragValue::new(&mut transition.trigger_state).range(0..=max_state));
+                ui.label("-> output:");
+                ui.add(DragValue::new(&mut transition.output_state).range(0..=max_state));
+                if ui.button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            self.automata_lab_discrete_settings
+                .presence_transitions
+                .remove(index);
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Add:");
+            ui.add(
+                DragValue::new(&mut self.automata_lab_presence_draft_trigger).range(0..=max_state),
+            );
+            ui.label("->");
+            ui.add(
+                DragValue::new(&mut self.automata_lab_presence_draft_output).range(0..=max_state),
+            );
+            if ui.button("Add transition").clicked() {
+                self.automata_lab_discrete_settings
+                    .presence_transitions
+                    .push(PresenceTransition {
+                        trigger_state: self.automata_lab_presence_draft_trigger,
+                        output_state: self.automata_lab_presence_draft_output,
+                    });
+            }
+        });
+
+        ui.separator();
+        ui.label("Fallback (no trigger present)");
+        self.show_discrete_dense_table(ui, DiscreteTableTarget::PresenceFallback);
+    }
+
+    fn show_discrete_dense_table(&mut self, ui: &mut Ui, target: DiscreteTableTarget) {
+        self.sync_discrete_table_lengths();
+        let state_count = self.automata_lab_discrete_settings.state_count;
+        let max_state = state_count.saturating_sub(1);
+        let table = match target {
+            DiscreteTableTarget::Direct => &mut self.automata_lab_discrete_settings.direct_table,
+            DiscreteTableTarget::Aggregate => {
+                &mut self.automata_lab_discrete_settings.aggregate_table
+            }
+            DiscreteTableTarget::Ordered => &mut self.automata_lab_discrete_settings.ordered_table,
+            DiscreteTableTarget::PresenceFallback => {
+                &mut self.automata_lab_discrete_settings.presence_fallback
+            }
+        };
+        let len = table.len();
+        ui.label(format!("{len} entries"));
+        if len > MAX_DISCRETE_UI_TABLE_LEN {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Table is too large to edit cell-by-cell here; use bulk fills, or hand-edit a saved experiment file once persistence lands.",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Identity").clicked() {
+                    for (index, value) in table.iter_mut().enumerate() {
+                        *value = (index as u32) % state_count;
+                    }
+                }
+                if ui.button("All -> 0").clicked() {
+                    table.fill(0);
+                }
+            });
+            return;
+        }
+        ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+            egui::Grid::new(("discrete_table_grid", target as u8)).show(ui, |ui| {
+                for (index, value) in table.iter_mut().enumerate() {
+                    ui.add(DragValue::new(value).range(0..=max_state));
+                    if (index + 1) % 8 == 0 {
+                        ui.end_row();
+                    }
+                }
+                ui.end_row();
+            });
+        });
+    }
+
     fn show_automata_lab_right_panel(&mut self, ui: &mut Ui) {
         Panel::right("right_panel")
             .resizable(true)
@@ -1068,7 +1532,18 @@ impl VCEMApp {
             .show(ui, |ui| {
                 ScrollArea::vertical().show(ui, |ui| {
                     ui.heading("Automata Lab");
-                    ui.label("Continuous Lenia v1");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.automata_lab_model_family,
+                            LabModelFamily::Discrete,
+                            "Discrete map",
+                        );
+                        ui.selectable_value(
+                            &mut self.automata_lab_model_family,
+                            LabModelFamily::Continuous,
+                            "Continuous Lenia",
+                        );
+                    });
                     ui.separator();
 
                     if let Some(displayed) = self.displayed_image.as_ref() {
@@ -1085,87 +1560,10 @@ impl VCEMApp {
                     }
 
                     ui.add_space(6.0);
-                    ui.collapsing("Kernel", |ui| {
-                        ui.add(
-                            egui::Slider::new(&mut self.automata_lab_settings.kernel_size, 1..=31)
-                                .step_by(2.0)
-                                .text("Size"),
-                        );
-                        if self.automata_lab_settings.kernel_size.is_multiple_of(2) {
-                            self.automata_lab_settings.kernel_size =
-                                (self.automata_lab_settings.kernel_size + 1).min(31);
-                        }
-                        ui.add(
-                            egui::Slider::new(
-                                &mut self.automata_lab_settings.kernel_ring_center,
-                                0.0..=1.5,
-                            )
-                            .text("Ring centre"),
-                        );
-                        ui.add(
-                            egui::Slider::new(
-                                &mut self.automata_lab_settings.kernel_ring_width,
-                                0.01..=0.75,
-                            )
-                            .text("Ring width"),
-                        );
-                        let boundary_label = match self.automata_lab_settings.boundary {
-                            ContinuousBoundaryPolicy::Clamp => "Clamp",
-                            ContinuousBoundaryPolicy::Reflect => "Reflect",
-                            ContinuousBoundaryPolicy::Wrap => "Wrap",
-                            ContinuousBoundaryPolicy::Constant { .. } => "Constant zero",
-                        };
-                        egui::ComboBox::from_label("Boundary")
-                            .selected_text(boundary_label)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.automata_lab_settings.boundary,
-                                    ContinuousBoundaryPolicy::Clamp,
-                                    "Clamp",
-                                );
-                                ui.selectable_value(
-                                    &mut self.automata_lab_settings.boundary,
-                                    ContinuousBoundaryPolicy::Reflect,
-                                    "Reflect",
-                                );
-                                ui.selectable_value(
-                                    &mut self.automata_lab_settings.boundary,
-                                    ContinuousBoundaryPolicy::Wrap,
-                                    "Wrap",
-                                );
-                                ui.selectable_value(
-                                    &mut self.automata_lab_settings.boundary,
-                                    ContinuousBoundaryPolicy::Constant { value: 0.0 },
-                                    "Constant zero",
-                                );
-                            });
-                    });
-
-                    ui.collapsing("Growth", |ui| {
-                        ui.add(
-                            egui::Slider::new(
-                                &mut self.automata_lab_settings.growth_center,
-                                -0.5..=1.5,
-                            )
-                            .text("Centre"),
-                        );
-                        ui.add(
-                            egui::Slider::new(
-                                &mut self.automata_lab_settings.growth_width,
-                                0.005..=0.5,
-                            )
-                            .text("Width"),
-                        );
-                        ui.add(
-                            egui::Slider::new(
-                                &mut self.automata_lab_settings.time_step,
-                                0.001..=0.5,
-                            )
-                            .logarithmic(true)
-                            .text("Time step"),
-                        );
-                    });
-
+                    match self.automata_lab_model_family {
+                        LabModelFamily::Discrete => self.show_discrete_lab_controls(ui),
+                        LabModelFamily::Continuous => self.show_continuous_lab_controls(ui),
+                    }
                     ui.collapsing("Playback", |ui| {
                         ui.add(
                             egui::Slider::new(&mut self.automata_lab_cycles_per_step, 1..=32)
@@ -1195,9 +1593,16 @@ impl VCEMApp {
                     });
 
                     let authored_program = self.displayed_image.as_ref().and_then(|displayed| {
-                        self.automata_lab_settings
-                            .program_document(displayed.calibration)
-                            .ok()
+                        match self.automata_lab_model_family {
+                            LabModelFamily::Continuous => self
+                                .automata_lab_settings
+                                .program_document(displayed.calibration)
+                                .ok(),
+                            LabModelFamily::Discrete => self
+                                .automata_lab_discrete_settings
+                                .program_document(displayed.calibration)
+                                .ok(),
+                        }
                     });
                     let settings_dirty =
                         self.automata_lab_session.as_ref().is_some_and(|session| {
@@ -1258,18 +1663,30 @@ impl VCEMApp {
                     });
 
                     if is_stepping {
+                        let cancelling = self
+                            .automata_lab_job
+                            .as_ref()
+                            .is_some_and(|job| job.discard_result);
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            if self
-                                .automata_lab_job
-                                .as_ref()
-                                .is_some_and(|job| job.discard_result)
-                            {
+                            if cancelling {
                                 ui.label("Cancelling computation…");
+                            } else if let Some((completed, total)) =
+                                self.automata_lab_step_progress
+                            {
+                                ui.label(format!("Computing generation {completed} of {total}…"));
                             } else {
                                 ui.label("Computing the next state…");
                             }
                         });
+                        if !cancelling
+                            && let Some((completed, total)) = self.automata_lab_step_progress
+                        {
+                            ui.add(
+                                egui::ProgressBar::new(completed as f32 / total.max(1) as f32)
+                                    .text(format!("{completed} / {total}")),
+                            );
+                        }
                     }
 
                     if let Some(error) = &self.automata_lab_error {
@@ -1321,34 +1738,37 @@ impl VCEMApp {
                         ));
                     }
 
-                    let checkpoints = self
+                    let checkpoint_generations = self
                         .automata_lab_session
                         .as_ref()
                         .map(|session| {
                             session
                                 .checkpoints()
                                 .iter()
-                                .enumerate()
-                                .map(|(index, checkpoint)| (index, checkpoint.generation))
+                                .map(|checkpoint| checkpoint.generation)
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
-                    if !checkpoints.is_empty() {
+                    if checkpoint_generations.len() > 1 {
                         ui.separator();
                         ui.collapsing("Timeline", |ui| {
-                            let mut restore = None;
-                            for (index, generation) in &checkpoints {
-                                if ui
-                                    .add_enabled(
-                                        !is_stepping,
-                                        Button::new(format!("Generation {generation}")),
-                                    )
-                                    .clicked()
-                                {
-                                    restore = Some(*index);
-                                }
-                            }
-                            if let Some(index) = restore {
+                            let max_index = checkpoint_generations.len() - 1;
+                            let mut index = max_index;
+                            let response = ui.add_enabled(
+                                !is_stepping,
+                                egui::Slider::new(&mut index, 0..=max_index).custom_formatter(
+                                    |value, _| {
+                                        format!(
+                                            "Generation {}",
+                                            checkpoint_generations[value as usize]
+                                        )
+                                    },
+                                ),
+                            );
+                            ui.label(
+                                "Drag to scrub. Scrubbing to an earlier generation discards later history.",
+                            );
+                            if response.changed() && index != max_index {
                                 self.restore_automata_lab_checkpoint(ui.ctx(), index);
                             }
                         });
@@ -1498,6 +1918,7 @@ impl VCEMApp {
         self.cancel_automata_lab_job();
         self.automata_lab_error = None;
         self.automata_lab_notice = None;
+        self.automata_lab_step_progress = None;
 
         let Some(displayed) = self.displayed_image.as_ref() else {
             self.automata_lab_error = Some(
@@ -1507,10 +1928,15 @@ impl VCEMApp {
             return;
         };
         let size = [displayed.size.x as usize, displayed.size.y as usize];
-        let program_document = match self
-            .automata_lab_settings
-            .program_document(displayed.calibration)
-        {
+        let program_document = match self.automata_lab_model_family {
+            LabModelFamily::Continuous => self
+                .automata_lab_settings
+                .program_document(displayed.calibration),
+            LabModelFamily::Discrete => self
+                .automata_lab_discrete_settings
+                .program_document(displayed.calibration),
+        };
+        let program_document = match program_document {
             Ok(program) => program,
             Err(error) => {
                 self.automata_lab_error = Some(error.to_string());
@@ -1546,6 +1972,7 @@ impl VCEMApp {
         self.cancel_automata_lab_job();
         self.automata_lab_error = None;
         self.automata_lab_notice = None;
+        self.automata_lab_step_progress = None;
         if let Some(session) = self.automata_lab_session.as_mut() {
             session.reset();
             self.automata_lab_notice = Some("Restored generation zero.".to_owned());
@@ -1559,6 +1986,12 @@ impl VCEMApp {
         }
         self.automata_lab_error = None;
         self.automata_lab_notice = None;
+        self.automata_lab_step_progress = None;
+        if cycles == 0 {
+            self.automata_lab_error =
+                Some("Automata Lab steps require at least one cycle.".to_owned());
+            return;
+        }
         let Some(mut session) = self.automata_lab_session.clone() else {
             self.automata_lab_error = Some("Initialize the Automata Lab first.".to_owned());
             return;
@@ -1568,12 +2001,65 @@ impl VCEMApp {
         let worker_cancellation = Arc::clone(&cancellation);
         let repaint_ctx = ctx.clone();
         thread::spawn(move || {
-            let result = session
-                .step_with_cancellation(cycles, &worker_cancellation)
-                .map(|outcome| (session, outcome))
-                .map_err(|error| error.to_string());
-            let _ = sender.send(result);
-            repaint_ctx.request_repaint();
+            // Catch a panic instead of letting it unwind the thread silently:
+            // an uncaught panic here would just drop `sender`, and the
+            // receiving side can only observe that as a disconnected channel
+            // with no information about what went wrong.
+            let panic_sender = sender.clone();
+            let panic_ctx = repaint_ctx.clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                // Advance one generation at a time so every intermediate state
+                // is reported: the overlay animates live instead of jumping
+                // straight to the result of a multi-cycle step, and the UI can
+                // show real "generation X of Y" progress rather than an
+                // indeterminate spin.
+                let mut completed = 0_u32;
+                let mut total_outcome = LabStepOutcome::default();
+                while completed < cycles {
+                    match session.step_with_cancellation(1, &worker_cancellation) {
+                        Ok(outcome) => {
+                            completed += 1;
+                            total_outcome.checkpoints_created += outcome.checkpoints_created;
+                            total_outcome.checkpoints_skipped_for_budget +=
+                                outcome.checkpoints_skipped_for_budget;
+                            let done = completed >= cycles;
+                            let update = if done {
+                                AutomataLabStepUpdate::Done {
+                                    session: Box::new(session.clone()),
+                                    outcome: total_outcome,
+                                }
+                            } else {
+                                AutomataLabStepUpdate::Progress {
+                                    state: session.current_state_snapshot(),
+                                    generation: session.generation(),
+                                    diagnostics: session.last_diagnostics(),
+                                    cycles_completed: completed,
+                                    cycles_total: cycles,
+                                }
+                            };
+                            if sender.send(update).is_err() {
+                                return;
+                            }
+                            repaint_ctx.request_repaint();
+                            if done {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(AutomataLabStepUpdate::Failed(error.to_string()));
+                            repaint_ctx.request_repaint();
+                            return;
+                        }
+                    }
+                }
+            }));
+            if let Err(panic_payload) = outcome {
+                let reason = panic_payload_message(&panic_payload);
+                let _ = panic_sender.send(AutomataLabStepUpdate::Failed(format!(
+                    "The Automata Lab worker crashed: {reason}. This is a bug; the current step's progress was discarded, but generation zero and earlier checkpoints/bookmarks are unaffected."
+                )));
+                panic_ctx.request_repaint();
+            }
         });
         self.automata_lab_job = Some(AutomataLabJob {
             receiver,
@@ -1588,23 +2074,69 @@ impl VCEMApp {
             return;
         };
         let discard_result = job.discard_result;
-        let result = match job.receiver.try_recv() {
-            Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(Duration::from_millis(16));
-                return;
+        // Drain every pending update so the UI never falls behind a fast
+        // worker; only the most recent update (which may be the terminal
+        // one) is applied.
+        let mut latest_update = None;
+        loop {
+            match job.receiver.try_recv() {
+                Ok(update) => latest_update = Some(update),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The worker thread should always send a Done/Failed
+                    // message before exiting, and catches its own panics to
+                    // report them as Failed (see step_automata_lab). Reaching
+                    // this without ever seeing a terminal message would mean
+                    // the process itself is in serious trouble (e.g. a stack
+                    // overflow, which aborts and cannot be caught) rather than
+                    // an ordinary bug in the step computation.
+                    latest_update = Some(AutomataLabStepUpdate::Failed(
+                        "The Automata Lab worker thread exited without reporting a result. \
+                         This should not happen and suggests a serious problem (such as a stack \
+                         overflow) rather than a normal computation error; check the terminal \
+                         you launched VCEM from for a crash message, and consider filing a bug \
+                         with the steps that triggered it."
+                            .to_owned(),
+                    ));
+                    break;
+                }
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Err("The Automata Lab worker stopped before returning a state.".to_owned())
-            }
+        }
+        let Some(update) = latest_update else {
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return;
         };
-        self.automata_lab_job = None;
+        let is_terminal = matches!(
+            update,
+            AutomataLabStepUpdate::Done { .. } | AutomataLabStepUpdate::Failed(_)
+        );
+        if is_terminal {
+            self.automata_lab_job = None;
+            self.automata_lab_step_progress = None;
+        }
         if discard_result {
+            if !is_terminal {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
             return;
         }
-        match result {
-            Ok((session, outcome)) => {
-                self.automata_lab_session = Some(session);
+        match update {
+            AutomataLabStepUpdate::Progress {
+                state,
+                generation,
+                diagnostics,
+                cycles_completed,
+                cycles_total,
+            } => {
+                if let Some(session) = self.automata_lab_session.as_mut() {
+                    session.apply_live_progress(state, generation, diagnostics);
+                }
+                self.automata_lab_step_progress = Some((cycles_completed, cycles_total));
+                self.refresh_automata_lab_texture(ctx);
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+            AutomataLabStepUpdate::Done { session, outcome } => {
+                self.automata_lab_session = Some(*session);
                 if outcome.checkpoints_skipped_for_budget > 0 {
                     self.automata_lab_notice = Some(format!(
                         "The step completed, but {} timeline checkpoint(s) exceeded the history budget.",
@@ -1613,7 +2145,7 @@ impl VCEMApp {
                 }
                 self.refresh_automata_lab_texture(ctx);
             }
-            Err(error) => {
+            AutomataLabStepUpdate::Failed(error) => {
                 self.automata_lab_playing = false;
                 self.automata_lab_error = Some(error);
             }
@@ -1695,31 +2227,53 @@ impl VCEMApp {
             self.automata_lab_texture = None;
             return;
         };
-        let specification = OverlayProjectionSpec {
-            version: OUTPUT_PROJECTION_VERSION,
-            field: NumericProjectionSpec {
+        let overlay = if let Some(state) = session.continuous_state() {
+            let specification = OverlayProjectionSpec {
                 version: OUTPUT_PROJECTION_VERSION,
-                source: ProjectionSource::NormalizedFinalState,
-                transfer: ProjectionTransfer::Power { exponent: 0.5 },
-            },
-            color: [48, 221, 255],
-            maximum_alpha: 224,
-        };
-        let Some(state) = session.continuous_state() else {
+                field: NumericProjectionSpec {
+                    version: OUTPUT_PROJECTION_VERSION,
+                    source: ProjectionSource::NormalizedFinalState,
+                    transfer: ProjectionTransfer::Power { exponent: 0.5 },
+                },
+                color: [48, 221, 255],
+                maximum_alpha: 224,
+            };
+            project_continuous_state_overlay(
+                state,
+                session.size(),
+                ContinuousDomain::UNIT,
+                &specification,
+                ProjectionLimits::default(),
+            )
+        } else if let Some(state) = session.discrete_state() {
+            let Some(state_count) = discrete_program_state_count(session.program_document()) else {
+                self.automata_lab_texture = None;
+                self.automata_lab_error =
+                    Some("Discrete Lab session is missing its state count.".to_owned());
+                return;
+            };
+            let specification = OverlayProjectionSpec {
+                version: OUTPUT_PROJECTION_VERSION,
+                field: NumericProjectionSpec {
+                    version: OUTPUT_PROJECTION_VERSION,
+                    source: ProjectionSource::NormalizedFinalState,
+                    transfer: ProjectionTransfer::Identity,
+                },
+                color: [255, 176, 32],
+                maximum_alpha: 224,
+            };
+            project_discrete_state_overlay(
+                state,
+                session.size(),
+                state_count,
+                &specification,
+                ProjectionLimits::default(),
+            )
+        } else {
             self.automata_lab_texture = None;
-            self.automata_lab_error = Some(
-                "The discrete Lab projection will be provided with discrete authoring controls."
-                    .to_owned(),
-            );
             return;
         };
-        match project_continuous_state_overlay(
-            state,
-            session.size(),
-            ContinuousDomain::UNIT,
-            &specification,
-            ProjectionLimits::default(),
-        ) {
+        match overlay {
             Ok(overlay) => {
                 let color_image =
                     egui::ColorImage::from_rgba_unmultiplied(overlay.size, &overlay.rgba);
@@ -1759,6 +2313,7 @@ impl VCEMApp {
         self.automata_lab_texture = None;
         self.automata_lab_error = None;
         self.automata_lab_notice = None;
+        self.automata_lab_step_progress = None;
     }
 
     fn cancel_automata_lab_job(&mut self) {
@@ -3261,6 +3816,58 @@ impl CellularKernelBrush {
     }
 }
 
+/// Above this dense table length, the discrete rule editor stops rendering a
+/// cell-by-cell grid and falls back to bulk-fill actions only. The engine's
+/// own `CompileLimits::max_table_bytes` (default 256 MiB) remains the real
+/// ceiling; this is purely a UI editing affordance.
+const MAX_DISCRETE_UI_TABLE_LEN: usize = 4096;
+
+/// Extracts a human-readable message from a caught worker-thread panic, so a
+/// crash surfaces as diagnosable text in the UI instead of a bare "the
+/// worker stopped" channel-disconnect error.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "no panic message was captured".to_owned()
+    }
+}
+
+fn discrete_program_state_count(document: &AutomataProgramDocument) -> Option<u32> {
+    match &document.transition_model {
+        AutomataModelDefinition::DiscreteMap(program) => Some(program.program.state_count),
+        _ => None,
+    }
+}
+
+fn discrete_rule_kind_label(kind: DiscreteRuleKind) -> &'static str {
+    match kind {
+        DiscreteRuleKind::Direct => "Direct",
+        DiscreteRuleKind::Aggregate => "Aggregate",
+        DiscreteRuleKind::OrderedNeighborhood => "Ordered neighbourhood",
+        DiscreteRuleKind::PresenceTriggered => "Presence triggered",
+    }
+}
+
+/// Converts a row-major `side x side` inclusion grid into kernel offsets in a
+/// fixed, deterministic scan order (never click/paint order), which matters
+/// for `OrderedNeighborhood`'s base-q table index.
+fn kernel_offsets_from_grid(included: &[bool], side: u32) -> Vec<KernelOffset> {
+    let side_usize = side as usize;
+    let half = (side / 2) as i32;
+    let mut offsets = Vec::new();
+    for y in 0..side_usize {
+        for x in 0..side_usize {
+            if included[y * side_usize + x] {
+                offsets.push(KernelOffset::new(x as i32 - half, y as i32 - half));
+            }
+        }
+    }
+    offsets
+}
+
 fn resize_cellular_kernel(settings: &mut CellularAutomataSettings, new_size: usize) {
     let new_size = new_size.clamp(3, 15) | 1;
     let old_size = settings.kernel_size;
@@ -3609,8 +4216,10 @@ impl App for VCEMApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        CellularKernelBrush, HistogramBinCountControl, toggle_kernel_weight, toggled_kernel_brush,
+        CellularKernelBrush, HistogramBinCountControl, kernel_offsets_from_grid,
+        toggle_kernel_weight, toggled_kernel_brush,
     };
+    use crate::discrete_automata::KernelOffset;
 
     #[test]
     fn downsampling_applies_atomically_and_persists_across_configuration_and_frames() {
@@ -3790,5 +4399,38 @@ mod tests {
             toggled_kernel_brush(1.0, CellularKernelBrush::Negative),
             CellularKernelBrush::Negative
         ));
+    }
+
+    #[test]
+    fn kernel_grid_offsets_use_a_fixed_row_major_order_regardless_of_toggle_order() {
+        // A 3x3 grid with the top-left and bottom-right corners included.
+        let included = [
+            true, false, false, //
+            false, false, false, //
+            false, false, true,
+        ];
+        let offsets = kernel_offsets_from_grid(&included, 3);
+        assert_eq!(
+            offsets,
+            vec![KernelOffset::new(-1, -1), KernelOffset::new(1, 1)]
+        );
+
+        // Toggling the same two cells in the opposite order must not change
+        // the resulting order: it always follows the row-major scan.
+        let same_included = [
+            false, false, true, //
+            false, false, false, //
+            true, false, false,
+        ];
+        let offsets_reversed_input = kernel_offsets_from_grid(&same_included, 3);
+        assert_eq!(
+            offsets_reversed_input,
+            vec![KernelOffset::new(1, -1), KernelOffset::new(-1, 1)]
+        );
+    }
+
+    #[test]
+    fn kernel_grid_offsets_are_empty_for_an_all_excluded_grid() {
+        assert!(kernel_offsets_from_grid(&[false; 9], 3).is_empty());
     }
 }

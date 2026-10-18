@@ -13,7 +13,7 @@ use crate::{
         AUTOMATA_PROGRAM_SCHEMA_VERSION, AutomataCompileLimits, AutomataFrameworkError,
         AutomataModelDefinition, AutomataProgramDocument, AutomataRunInput,
         AutomataSimulationResult, CompiledAutomataProgram, ContinuousLeniaProgramDefinition,
-        compile_automata_program, run_compiled_automata_with_cancellation,
+        DiscreteMapProgram, compile_automata_program, run_compiled_automata_with_cancellation,
     },
     continuous_automata::{
         CONTINUOUS_INITIALIZER_VERSION, CONTINUOUS_LENIA_PROGRAM_VERSION,
@@ -23,10 +23,12 @@ use crate::{
         KernelNormalization,
     },
     discrete_automata::{
-        CompactState, DISCRETE_RUN_CONFIG_VERSION, DiscreteAutomataError, DiscreteDiagnostics,
-        DiscreteRunConfig,
+        AggregateReducer, BoundaryPolicy, CompactState, DISCRETE_PROGRAM_VERSION,
+        DISCRETE_RUN_CONFIG_VERSION, DiscreteAutomataError, DiscreteDiagnostics, DiscreteProgram,
+        DiscreteRule, DiscreteRuleKind, DiscreteRunConfig, KernelOffset, PresenceReduction,
+        PresenceTransition, StateStorage,
     },
-    quantization::IntensityCalibration,
+    quantization::{HistogramStateInitializer, IntensityCalibration},
 };
 
 const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
@@ -122,6 +124,163 @@ impl LeniaLabSettings {
     }
 }
 
+/// Editable discrete-map controls. This is an authoring adapter rather than a
+/// second persisted program format: the Lab compiles the resulting shared
+/// program document and retains that document as the session identity. The
+/// discrete Lab always uses an identity histogram initializer (bin count
+/// equal to state count); bin-merging initializers remain a later addition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiscreteLabSettings {
+    pub state_count: u32,
+    pub kernel: Vec<KernelOffset>,
+    pub boundary: BoundaryPolicy,
+    pub rule_kind: DiscreteRuleKind,
+    pub direct_table: Vec<u32>,
+    pub aggregate_reducer: AggregateReducer,
+    pub aggregate_table: Vec<u32>,
+    pub ordered_table: Vec<u32>,
+    pub presence_transitions: Vec<PresenceTransition>,
+    pub presence_reduction: PresenceReduction,
+    pub presence_fallback: Vec<u32>,
+}
+
+impl Default for DiscreteLabSettings {
+    fn default() -> Self {
+        Self {
+            state_count: 2,
+            kernel: Vec::new(),
+            boundary: BoundaryPolicy::Wrap,
+            rule_kind: DiscreteRuleKind::Direct,
+            direct_table: vec![0, 1],
+            aggregate_reducer: AggregateReducer::RoundedMean,
+            aggregate_table: vec![0, 1],
+            ordered_table: vec![0],
+            presence_transitions: Vec::new(),
+            presence_reduction: PresenceReduction::LowestTrigger,
+            presence_fallback: vec![0, 1],
+        }
+    }
+}
+
+impl DiscreteLabSettings {
+    /// The dense table length the current rule/state/kernel configuration
+    /// requires, mirroring the engine's own sizing formulas so authoring
+    /// controls can be kept in sync before compilation.
+    pub fn expected_table_len(&self) -> Result<usize, AutomataLabError> {
+        let state_count =
+            usize::try_from(self.state_count).map_err(|_| AutomataLabError::SizeOverflow)?;
+        match self.rule_kind {
+            DiscreteRuleKind::Direct | DiscreteRuleKind::PresenceTriggered => Ok(state_count),
+            DiscreteRuleKind::Aggregate => match self.aggregate_reducer {
+                AggregateReducer::RoundedMean => Ok(state_count),
+                AggregateReducer::Sum => {
+                    let per_sample = state_count
+                        .checked_sub(1)
+                        .ok_or(AutomataLabError::SizeOverflow)?;
+                    self.kernel
+                        .len()
+                        .checked_mul(per_sample)
+                        .and_then(|maximum| maximum.checked_add(1))
+                        .ok_or(AutomataLabError::SizeOverflow)
+                }
+            },
+            DiscreteRuleKind::OrderedNeighborhood => {
+                let mut result = 1_usize;
+                for _ in 0..self.kernel.len() {
+                    result = result
+                        .checked_mul(state_count)
+                        .ok_or(AutomataLabError::SizeOverflow)?;
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), AutomataLabError> {
+        if self.state_count < 2 {
+            return Err(AutomataLabError::InvalidSettings(
+                "Discrete Lab state_count must be at least 2.".to_owned(),
+            ));
+        }
+        if !matches!(self.rule_kind, DiscreteRuleKind::Direct) && self.kernel.is_empty() {
+            return Err(AutomataLabError::InvalidSettings(
+                "The selected discrete rule requires at least one kernel sample.".to_owned(),
+            ));
+        }
+        let expected_len = self.expected_table_len()?;
+        let (table_len, table_name) = match self.rule_kind {
+            DiscreteRuleKind::Direct => (self.direct_table.len(), "direct"),
+            DiscreteRuleKind::Aggregate => (self.aggregate_table.len(), "aggregate"),
+            DiscreteRuleKind::OrderedNeighborhood => {
+                (self.ordered_table.len(), "ordered-neighbourhood")
+            }
+            DiscreteRuleKind::PresenceTriggered => {
+                (self.presence_fallback.len(), "presence-triggered fallback")
+            }
+        };
+        if table_len != expected_len {
+            return Err(AutomataLabError::InvalidSettings(format!(
+                "The {table_name} table has {table_len} entries; expected {expected_len}."
+            )));
+        }
+        Ok(())
+    }
+
+    fn packed_rule(&self) -> Result<DiscreteRule, AutomataLabError> {
+        let pack = |values: Vec<u32>| {
+            CompactState::pack(values, self.state_count)
+                .map_err(|error| AutomataLabError::InvalidSettings(error.to_string()))
+        };
+        Ok(match self.rule_kind {
+            DiscreteRuleKind::Direct => DiscreteRule::Direct {
+                table: pack(self.direct_table.clone())?,
+            },
+            DiscreteRuleKind::Aggregate => DiscreteRule::Aggregate {
+                reducer: self.aggregate_reducer,
+                table: pack(self.aggregate_table.clone())?,
+            },
+            DiscreteRuleKind::OrderedNeighborhood => DiscreteRule::OrderedNeighborhood {
+                table: pack(self.ordered_table.clone())?,
+            },
+            DiscreteRuleKind::PresenceTriggered => DiscreteRule::PresenceTriggered {
+                transitions: self.presence_transitions.clone(),
+                reduction: self.presence_reduction,
+                fallback: pack(self.presence_fallback.clone())?,
+            },
+        })
+    }
+
+    pub fn program_document(
+        &self,
+        calibration: IntensityCalibration,
+    ) -> Result<AutomataProgramDocument, AutomataLabError> {
+        self.validate()?;
+        let storage = StateStorage::for_state_count(self.state_count)
+            .map_err(|error| AutomataLabError::InvalidSettings(error.to_string()))?;
+        Ok(AutomataProgramDocument {
+            schema_version: AUTOMATA_PROGRAM_SCHEMA_VERSION,
+            transition_model: AutomataModelDefinition::DiscreteMap(DiscreteMapProgram {
+                initializer: HistogramStateInitializer::identity(calibration, self.state_count),
+                program: DiscreteProgram {
+                    version: DISCRETE_PROGRAM_VERSION,
+                    state_count: self.state_count,
+                    storage,
+                    kernel: self.kernel.clone(),
+                    boundary: self.boundary,
+                    rule: self.packed_rule()?,
+                },
+            }),
+        })
+    }
+}
+
+/// Resizes an authoring table to `new_len`, truncating or padding with
+/// `default_value` while preserving existing entries at their positions.
+pub fn resized_table(mut table: Vec<u32>, new_len: usize, default_value: u32) -> Vec<u32> {
+    table.resize(new_len, default_value);
+    table
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LabExecutionPolicy {
     pub max_working_memory_bytes: u64,
@@ -186,6 +345,15 @@ pub enum LabDiagnostics {
 
 #[derive(Clone, Debug)]
 enum LabState {
+    Discrete(Arc<CompactState>),
+    Continuous(Arc<Vec<f32>>),
+}
+
+/// A cheap, cloneable handle to a Lab state, independent of the private
+/// [`LabState`] enum, for crossing thread/module boundaries without paying
+/// for a full [`AutomataLabSession`] clone.
+#[derive(Clone, Debug)]
+pub enum LabStateSnapshot {
     Discrete(Arc<CompactState>),
     Continuous(Arc<Vec<f32>>),
 }
@@ -376,6 +544,37 @@ impl AutomataLabSession {
 
     pub fn last_diagnostics(&self) -> Option<LabDiagnostics> {
         self.last_diagnostics
+    }
+
+    /// A cheap (Arc-clone-only) handle to the current state, independent of
+    /// checkpoints and bookmarks. Interactive callers that need to report
+    /// per-generation progress across a thread boundary should use this
+    /// instead of cloning the whole session, whose `checkpoints`/`bookmarks`
+    /// vectors are not Arc-wrapped and can grow throughout a long session.
+    pub fn current_state_snapshot(&self) -> LabStateSnapshot {
+        match &self.current_state {
+            LabState::Discrete(state) => LabStateSnapshot::Discrete(Arc::clone(state)),
+            LabState::Continuous(state) => LabStateSnapshot::Continuous(Arc::clone(state)),
+        }
+    }
+
+    /// Applies a live progress update to the current state/generation/
+    /// diagnostics only, leaving checkpoints and bookmarks untouched. Pairs
+    /// with [`Self::current_state_snapshot`] so interactive callers can
+    /// report intermediate progress without the O(history size) cost of
+    /// cloning the full session on every generation.
+    pub fn apply_live_progress(
+        &mut self,
+        state: LabStateSnapshot,
+        generation: u32,
+        diagnostics: Option<LabDiagnostics>,
+    ) {
+        self.current_state = match state {
+            LabStateSnapshot::Discrete(state) => LabState::Discrete(state),
+            LabStateSnapshot::Continuous(state) => LabState::Continuous(state),
+        };
+        self.generation = generation;
+        self.last_diagnostics = diagnostics;
     }
 
     pub fn checkpoints(&self) -> &[LabCheckpoint] {
@@ -879,6 +1078,36 @@ mod tests {
     }
 
     #[test]
+    fn live_progress_updates_state_without_touching_checkpoints_or_bookmarks() {
+        let mut session = continuous_session(LabCapturePolicy::default()).unwrap();
+        session.step(1).unwrap();
+        session.save_bookmark("first").unwrap();
+
+        session.step(1).unwrap();
+        let advanced_state = session.continuous_state().unwrap().to_vec();
+        let advanced_generation = session.generation();
+        let advanced_diagnostics = session.last_diagnostics();
+        let checkpoints_before = session.checkpoints().len();
+        let bookmarks_before = session.bookmarks().len();
+
+        // A cheap snapshot-and-apply round trip (what the interactive step
+        // worker uses to report per-generation progress) must reproduce the
+        // same observable state...
+        let snapshot = session.current_state_snapshot();
+        session.apply_live_progress(snapshot, advanced_generation, advanced_diagnostics);
+        assert_eq!(session.generation(), advanced_generation);
+        assert_eq!(session.continuous_state().unwrap(), advanced_state);
+        assert_eq!(session.last_diagnostics(), advanced_diagnostics);
+
+        // ...without growing or otherwise touching checkpoints/bookmarks:
+        // that history is exactly what makes a full `AutomataLabSession`
+        // clone expensive over a long session, so live progress reporting
+        // must not depend on it.
+        assert_eq!(session.checkpoints().len(), checkpoints_before);
+        assert_eq!(session.bookmarks().len(), bookmarks_before);
+    }
+
+    #[test]
     fn multi_cycle_steps_capture_every_exact_interval() {
         let mut session = continuous_session(LabCapturePolicy {
             checkpoint_interval: 2,
@@ -941,6 +1170,94 @@ mod tests {
             session.retained_history_bytes(),
             2 * 4 * size_of::<f32>() as u64
         );
+    }
+
+    #[test]
+    fn discrete_authoring_controls_compile_for_every_rule_kind() {
+        let calibration = IntensityCalibration::full_scale(256).unwrap();
+        let base = DiscreteLabSettings {
+            kernel: vec![KernelOffset::new(-1, 0), KernelOffset::new(1, 0)],
+            ..DiscreteLabSettings::default()
+        };
+
+        let direct = DiscreteLabSettings {
+            direct_table: vec![1, 0],
+            ..base.clone()
+        };
+        let document = direct.program_document(calibration).unwrap();
+        assert!(matches!(
+            document.transition_model,
+            AutomataModelDefinition::DiscreteMap(_)
+        ));
+        compile_automata_program(document, AutomataCompileLimits::default()).unwrap();
+
+        let aggregate = DiscreteLabSettings {
+            rule_kind: DiscreteRuleKind::Aggregate,
+            aggregate_reducer: AggregateReducer::Sum,
+            aggregate_table: resized_table(Vec::new(), 3, 0),
+            ..base.clone()
+        };
+        compile_automata_program(
+            aggregate.program_document(calibration).unwrap(),
+            AutomataCompileLimits::default(),
+        )
+        .unwrap();
+
+        let ordered = DiscreteLabSettings {
+            rule_kind: DiscreteRuleKind::OrderedNeighborhood,
+            ordered_table: resized_table(Vec::new(), 4, 0),
+            ..base.clone()
+        };
+        compile_automata_program(
+            ordered.program_document(calibration).unwrap(),
+            AutomataCompileLimits::default(),
+        )
+        .unwrap();
+
+        let presence = DiscreteLabSettings {
+            rule_kind: DiscreteRuleKind::PresenceTriggered,
+            presence_transitions: vec![PresenceTransition {
+                trigger_state: 1,
+                output_state: 0,
+            }],
+            ..base
+        };
+        compile_automata_program(
+            presence.program_document(calibration).unwrap(),
+            AutomataCompileLimits::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn invalid_discrete_settings_fail_before_compiling() {
+        let calibration = IntensityCalibration::full_scale(256).unwrap();
+        let missing_kernel = DiscreteLabSettings {
+            rule_kind: DiscreteRuleKind::OrderedNeighborhood,
+            ordered_table: vec![0, 1],
+            ..DiscreteLabSettings::default()
+        };
+        assert!(matches!(
+            missing_kernel.program_document(calibration),
+            Err(AutomataLabError::InvalidSettings(_))
+        ));
+
+        let wrong_length = DiscreteLabSettings {
+            direct_table: vec![0],
+            ..DiscreteLabSettings::default()
+        };
+        assert!(matches!(
+            wrong_length.program_document(calibration),
+            Err(AutomataLabError::InvalidSettings(_))
+        ));
+    }
+
+    #[test]
+    fn resized_table_preserves_prefix_values() {
+        let table = resized_table(vec![3, 1, 4], 5, 9);
+        assert_eq!(table, [3, 1, 4, 9, 9]);
+        let truncated = resized_table(vec![3, 1, 4, 1, 5], 2, 0);
+        assert_eq!(truncated, [3, 1]);
     }
 
     #[test]
