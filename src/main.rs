@@ -7,6 +7,7 @@ pub mod automata_projection;
 pub mod continuous_automata;
 pub mod discrete_automata;
 mod downsampling;
+mod masks;
 pub mod quantization;
 pub mod types;
 

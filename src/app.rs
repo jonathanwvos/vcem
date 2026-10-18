@@ -1,3 +1,5 @@
+mod masks;
+
 use eframe::{
     App, CreationContext, Frame,
     egui::{
@@ -19,7 +21,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::analysis::processed_image_from_path;
 use crate::automata::{AutomataCompileLimits, AutomataModelDefinition, AutomataProgramDocument};
 use crate::automata_lab::{
     AutomataLabSession, DiscreteLabSettings, LabCapturePolicy, LabDiagnostics, LabExecutionPolicy,
@@ -38,10 +39,11 @@ use crate::discrete_automata::{
 use crate::types::{
     CellularAutomataResponse, CellularAutomataSeedMode, CellularAutomataSettings, DenoiseMethod,
     DenoiseSettings, DisplayedImage, DownsamplingMethod, ExperimentConfiguration, ImageFile,
-    ImageRotation, IntensityHistogram, ProcessedImage,
+    ImageRotation, IntensityHistogram, ProcessedImage, validate_experiment_configuration,
 };
 
 pub struct VCEMApp {
+    masks: masks::MaskUi,
     upper_panel_expanded: bool,
     view_mode: ViewMode,
     images: Vec<ImageFile>,
@@ -161,7 +163,7 @@ struct ProcessingResult {
     image_index: usize,
     image_name: String,
     kind: ProcessingKind,
-    result: std::result::Result<ProcessedImage, String>,
+    result: std::result::Result<(ProcessedImage, crate::masks::MaskFrame), String>,
 }
 
 #[derive(Clone)]
@@ -269,6 +271,7 @@ impl VCEMApp {
             .to_string();
 
         Self {
+            masks: masks::MaskUi::default(),
             upper_panel_expanded: true,
             view_mode: ViewMode::Inspect,
             images: Vec::new(),
@@ -538,7 +541,7 @@ impl VCEMApp {
                     if let Some(image) =
                         self.selected_image.and_then(|index| self.images.get(index))
                     {
-                        let is_processing = self.processing_job.is_some();
+                        let is_processing = self.processing_job.is_some() || self.masks.is_busy();
 
                         ui.label(format!("File: {}", image.name));
                         if let Some(displayed) = self
@@ -730,6 +733,8 @@ impl VCEMApp {
                             self.apply_gamma_adjustment(ui.ctx());
                         }
 
+                        ui.add_space(8.0);
+                        self.show_mask_controls(ui, is_processing);
                         ui.add_space(8.0);
                         self.show_cellular_automata_controls(ui, is_processing);
                     } else {
@@ -1108,7 +1113,7 @@ impl VCEMApp {
             if ui
                 .add_enabled(
                     !is_processing && self.applied_cellular_automata.is_some(),
-                    Button::new("Remove Overlay"),
+                    Button::new("Remove CA Overlay"),
                 )
                 .on_hover_text("Removes the CA overlay while keeping other applied augmentations.")
                 .clicked()
@@ -2388,6 +2393,7 @@ impl VCEMApp {
 
             self.ensure_selected_image_loaded(ui.ctx());
             self.ensure_histogram_highlight_texture(ui.ctx());
+            self.masks.refresh(ui.ctx());
 
             if let Some(error) = &self.viewer_error {
                 painter.text(
@@ -2463,7 +2469,12 @@ impl VCEMApp {
             let image_rect =
                 Rect::from_center_size(canvas_rect.center() + self.viewer_pan, draw_size);
 
-            if response.drag_started_by(PointerButton::Primary) {
+            let marking_region = self.masks.marking() && self.processing_job.is_none();
+            if marking_region {
+                self.masks.region_pointer(&response, image_rect);
+                self.image_selection_start = None;
+            }
+            if !marking_region && response.drag_started_by(PointerButton::Primary) {
                 self.image_selection_start = response
                     .interact_pointer_pos()
                     .filter(|pointer| image_rect.contains(*pointer));
@@ -2492,15 +2503,16 @@ impl VCEMApp {
                 self.image_selection_start = None;
             }
 
-            let clicked_image_bin = if response.clicked_by(PointerButton::Primary) {
-                response.interact_pointer_pos().and_then(|pointer| {
-                    self.displayed_image
-                        .as_ref()
-                        .and_then(|displayed| displayed.bin_at_pointer(image_rect, pointer))
-                })
-            } else {
-                None
-            };
+            let clicked_image_bin =
+                if !marking_region && response.clicked_by(PointerButton::Primary) {
+                    response.interact_pointer_pos().and_then(|pointer| {
+                        self.displayed_image
+                            .as_ref()
+                            .and_then(|displayed| displayed.bin_at_pointer(image_rect, pointer))
+                    })
+                } else {
+                    None
+                };
             if let Some(bin) = clicked_image_bin {
                 self.select_single_histogram_bin(bin);
                 ui.ctx().request_repaint();
@@ -2520,7 +2532,9 @@ impl VCEMApp {
                 Color32::WHITE,
             );
 
-            if let Some(cellular_texture_id) = cellular_texture_id {
+            if let Some(cellular_texture_id) =
+                cellular_texture_id.filter(|_| !self.masks.suppress_other_overlays())
+            {
                 painter.image(
                     cellular_texture_id,
                     image_rect,
@@ -2529,7 +2543,19 @@ impl VCEMApp {
                 );
             }
 
-            if let Some(highlight_texture_id) = highlight_texture_id {
+            if let Some(mask_texture) = self.masks.texture_id() {
+                painter.image(
+                    mask_texture,
+                    image_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            self.masks.paint_regions(&painter, image_rect);
+
+            if let Some(highlight_texture_id) =
+                highlight_texture_id.filter(|_| !self.masks.suppress_other_overlays())
+            {
                 painter.image(
                     highlight_texture_id,
                     image_rect,
@@ -3297,7 +3323,7 @@ impl VCEMApp {
         let job_kind = kind.clone();
 
         thread::spawn(move || {
-            let result = processed_image_from_path(&path, kind.parameters());
+            let result = crate::masks::process_source(&path, kind.parameters());
             let _ = sender.send(ProcessingResult {
                 id,
                 image_index,
@@ -3339,7 +3365,14 @@ impl VCEMApp {
         }
 
         match result.result {
-            Ok(processed) => {
+            Ok((processed, mask_frame)) => {
+                self.masks.activate(mask_frame);
+                if matches!(
+                    &result.kind,
+                    ProcessingKind::CellularAutomata(_) | ProcessingKind::Configuration(_)
+                ) {
+                    self.masks.show_current_ca();
+                }
                 self.invalidate_automata_lab();
                 if result.kind.parameters().downsampling != self.applied_downsampling {
                     self.clear_histogram_highlight();
@@ -4036,75 +4069,6 @@ fn zoom_hovered_plot_with_scroll(plot_ui: &mut PlotUi<'_>) {
         .input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
 }
 
-fn validate_experiment_configuration(
-    configuration: &ExperimentConfiguration,
-) -> std::result::Result<(), String> {
-    if configuration.schema_version != 1 {
-        return Err(format!(
-            "Unsupported configuration schema version {}.",
-            configuration.schema_version
-        ));
-    }
-    if !(2..=4096).contains(&configuration.histogram_bin_count) {
-        return Err("Histogram bin count must be between 2 and 4096.".to_owned());
-    }
-    if let Some(denoise) = configuration.denoise
-        && !matches!(denoise.kernel_size, 3 | 5 | 7)
-    {
-        return Err("Denoising kernel size must be 3, 5, or 7.".to_owned());
-    }
-    if configuration
-        .equalization
-        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
-    {
-        return Err("Equalization strength must be between 0 and 1.".to_owned());
-    }
-    if configuration
-        .gamma
-        .is_some_and(|value| !value.is_finite() || !(0.001..=4.0).contains(&value))
-    {
-        return Err("Gamma must be between 0.001 and 4.".to_owned());
-    }
-
-    if let Some(settings) = &configuration.cellular_automata {
-        if !(3..=15).contains(&settings.kernel_size)
-            || settings.kernel_size.is_multiple_of(2)
-            || settings.kernel.len() != settings.kernel_size * settings.kernel_size
-        {
-            return Err("Cellular kernel must be an odd square from 3 x 3 to 15 x 15.".to_owned());
-        }
-        if settings.kernel.iter().any(|weight| !weight.is_finite())
-            || !settings
-                .kernel
-                .iter()
-                .any(|weight| weight.abs() > f32::EPSILON)
-        {
-            return Err("Cellular kernel must contain finite, non-zero weights.".to_owned());
-        }
-        let scalar_values = [
-            settings.response_center,
-            settings.response_width,
-            settings.growth_rate,
-            settings.decay_rate,
-            settings.time_step,
-        ];
-        if scalar_values.iter().any(|value| !value.is_finite()) {
-            return Err("Cellular response and evolution values must be finite.".to_owned());
-        }
-        if !(-1.0..=1.0).contains(&settings.response_center)
-            || !(0.01..=1.0).contains(&settings.response_width)
-            || !(0.0..=2.0).contains(&settings.growth_rate)
-            || !(0.0..=2.0).contains(&settings.decay_rate)
-            || !(0.01..=0.5).contains(&settings.time_step)
-            || !(1..=128).contains(&settings.iterations)
-        {
-            return Err("Cellular settings fall outside the supported UI ranges.".to_owned());
-        }
-    }
-
-    Ok(())
-}
-
 impl DisplayedImage {
     fn pixel_count(&self) -> usize {
         self.size.x as usize * self.size.y as usize
@@ -4202,6 +4166,7 @@ impl DenoiseMethod {
 impl App for VCEMApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
         self.poll_processing_job(ui.ctx());
+        self.masks.poll(ui.ctx());
         self.poll_automata_lab_job(ui.ctx());
         self.advance_automata_lab(ui.ctx());
         self.show_upper_panel(ui);

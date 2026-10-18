@@ -151,6 +151,75 @@ pub struct IntensityHistogram {
     pub source_description: String,
 }
 
+pub fn validate_experiment_configuration(
+    configuration: &ExperimentConfiguration,
+) -> std::result::Result<(), String> {
+    if configuration.schema_version != 1 {
+        return Err(format!(
+            "Unsupported configuration schema version {}.",
+            configuration.schema_version
+        ));
+    }
+    if !(2..=4096).contains(&configuration.histogram_bin_count) {
+        return Err("Histogram bin count must be between 2 and 4096.".to_owned());
+    }
+    if let Some(denoise) = configuration.denoise
+        && !matches!(denoise.kernel_size, 3 | 5 | 7)
+    {
+        return Err("Denoising kernel size must be 3, 5, or 7.".to_owned());
+    }
+    if configuration
+        .equalization
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err("Equalization strength must be between 0 and 1.".to_owned());
+    }
+    if configuration
+        .gamma
+        .is_some_and(|value| !value.is_finite() || !(0.001..=4.0).contains(&value))
+    {
+        return Err("Gamma must be between 0.001 and 4.".to_owned());
+    }
+
+    if let Some(settings) = &configuration.cellular_automata {
+        if !(3..=15).contains(&settings.kernel_size)
+            || settings.kernel_size.is_multiple_of(2)
+            || settings.kernel.len() != settings.kernel_size * settings.kernel_size
+        {
+            return Err("Cellular kernel must be an odd square from 3 x 3 to 15 x 15.".to_owned());
+        }
+        if settings.kernel.iter().any(|weight| !weight.is_finite())
+            || !settings
+                .kernel
+                .iter()
+                .any(|weight| weight.abs() > f32::EPSILON)
+        {
+            return Err("Cellular kernel must contain finite, non-zero weights.".to_owned());
+        }
+        let scalar_values = [
+            settings.response_center,
+            settings.response_width,
+            settings.growth_rate,
+            settings.decay_rate,
+            settings.time_step,
+        ];
+        if scalar_values.iter().any(|value| !value.is_finite()) {
+            return Err("Cellular response and evolution values must be finite.".to_owned());
+        }
+        if !(-1.0..=1.0).contains(&settings.response_center)
+            || !(0.01..=1.0).contains(&settings.response_width)
+            || !(0.0..=2.0).contains(&settings.growth_rate)
+            || !(0.0..=2.0).contains(&settings.decay_rate)
+            || !(0.01..=0.5).contains(&settings.time_step)
+            || !(1..=128).contains(&settings.iterations)
+        {
+            return Err("Cellular settings fall outside the supported UI ranges.".to_owned());
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
