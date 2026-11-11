@@ -736,7 +736,7 @@ fn cellular_automata_overlay(
                 source: ProjectionSource::NormalizedFinalState,
                 transfer: ProjectionTransfer::Power { exponent: 0.5 },
             },
-            color: [30, 210, 190],
+            color: crate::types::CA_MASK_RGB,
             maximum_alpha: 190,
         },
         ProjectionLimits::default(),

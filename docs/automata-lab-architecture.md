@@ -15,10 +15,26 @@
 - Stage 3 is complete at the engine boundary. Versioned projections derive normalized scalar fields, discrete-state membership, masks, and RGBA overlays from any validated final result without rerunning a model. The normal legacy overlay now uses this projection path with its original palette and square-root alpha transfer.
 - Versioned run records bind an immutable prepared-plane identity, source identity, calibration, experiment/ROI lineage, complete program document, model-specific run specification, optional deterministic seed, and validated numeric result. Record creation revalidates the borrowed program under explicit compile limits and rejects result dimensions, state cardinality/domain, cycle counts, or diagnostics that disagree with the recorded program and run specification.
 - The first Stage 4 interactive slice is complete for continuous Lenia. A dedicated Automata Lab view retains the selected image's calibrated prepared plane, initializes generation zero from that plane, renders the current numeric state as a disposable superimposed projection, and exposes Reset, background-threaded Step, timed Play/Pause, diagnostics, budgeted in-memory timeline checkpoints, and named state bookmarks.
-- The consolidation pass removed the Lab's parallel model format and runner. A session now owns the same strict `AutomataProgramDocument` and compiled dispatcher used at the engine boundary; both discrete-map and continuous-Lenia programs run through that session, while the current UI remains a continuous-Lenia authoring facade. Editable Lenia controls are an unpersisted adapter that produces the shared document.
+- The consolidation pass removed the Lab's parallel model format and runner. A session now owns the same strict `AutomataProgramDocument` and compiled dispatcher used at the engine boundary; both discrete-map and continuous-Lenia programs run through that session, with authoring controls now exposed for both model families. Editable controls produce the shared document and can be persisted in a Lab experiment configuration.
 - Execution policy and capture policy are separate from model identity. Checkpoints are captured at exact generation multiples even when one UI step crosses several intervals; changing capture cadence does not reset or recompile the automaton. State buffers and dense compiled tables are shared across session clones where possible and history is bounded by an explicit byte budget.
 - Lab computation is cooperatively cancellable at every generation and commits atomically. Resetting, changing settings, or changing the prepared source marks the single outstanding worker result for discard and signals cancellation; a second worker is not started until the first exits.
-- Lab sessions are invalidated when image selection or preprocessing changes, so a state cannot silently outlive the prepared plane that initialized it. Editing transition settings pauses playback and requires an explicit apply-and-reset operation. Persisted Lab experiments, discrete rule authoring controls, temporal result projections, and ROI child tabs remain subsequent Stage 4/5 work.
+- Lab sessions are invalidated when image selection or preprocessing changes, so a state cannot silently outlive the prepared plane that initialized it. Editing transition settings pauses playback and requires an explicit apply-and-reset operation. Lab experiment persistence and discrete rule authoring are now implemented. Temporal result projections and ROI child tabs remain subsequent Stage 4/5 work.
+
+### Lab authoring and mask composition update
+
+The Lab now shares the image-preparation controls and viewer with Inspect. Both discrete-map and continuous-Lenia authoring are exposed. Discrete kernels support positive samples and negative samples that reverse the state order (`q - 1 - state`); omitted polarity in older programs remains positive. Empty cells are absent from the kernel. Direct rules ignore the kernel; other rules consume the transformed samples before their existing lookup operation.
+
+Versioned `LabExperimentConfiguration` documents persist the bounded authoring settings, image preprocessing, and target generation. The authoring settings still compile through the shared `AutomataProgramDocument` dispatcher; they do not introduce a separate execution model. Save Applied snapshots the applied settings, and replay initializes from the prepared image before running to the captured generation. Timelines and bookmarks remain session-only.
+
+Mask recipe version 2 adds Lab layers alongside Inspect layers. A Lab layer stores its experiment configuration and normalized-state threshold, and rebuilds through the same Lab engine. Discrete states normalize to `state / (q - 1)`. Version 1 Inspect recipes remain readable. Boolean operations consume the resulting masks without coupling the running automata. The Lab UI also provides deterministic seeded generators, rule graphs, an initial-state histogram, and Lenia kernel/growth visualizations.
+
+### Shared kernel editor and region candidates
+
+Inspect and discrete Lab now share kernel composition controls, including shape presets, directional angles, and cardinal-orientation evaluation. Discrete programs optionally serialize `omni_directional` (missing means false); each generation evaluates the same mapping against the rotated kernels and retains the highest mapped state. Ordered sample order is preserved during rotation. Negative samples still reverse state IDs before lookup.
+
+Region candidate fitting runs asynchronously on a snapshot of the prepared image. It compares sampled aggregate-sum signatures inside an example rectangle with signatures in its surrounding context. The candidate fitter and simulation engine share signed sampling and boundary semantics. Directional, local-intensity, seeded, and optional current kernels yield at most four ranked proposals. Previews represent one generation; selecting a proposal initializes and executes that configuration through the normal Lab engine on the full prepared image. Capturing the result uses the existing version 2 mask recipe path. Fitting scores describe region contrast, not independent validation, and source/preprocessing changes invalidate pending candidates.
+
+Simulation status uses fixed layout slots. Live overlays and masks use teal, pixel selection uses amber, and comparison overlap uses blue.
 
 ## Context
 
@@ -34,7 +50,7 @@ The normal workflow will offer a compact discrete-CA feature suitable for routin
 
 Both workflows use the same state initialization, automata engine, result, and projection interfaces. The normal workflow is a constrained facade over those interfaces; it is not a second CA implementation.
 
-One experiment has exactly one transition model and one compatible state representation. Discrete, continuous, and legacy modalities are not mixed during a run. A later composition workflow may combine the immutable outputs of independently validated models.
+One experiment has exactly one transition model and one compatible state representation. Discrete, continuous, and legacy modalities are not mixed during a run. The mask workspace combines projections of completed results from independently validated models.
 
 ### Common execution model
 
@@ -132,7 +148,7 @@ The implemented run-provenance record stores this lineage together with stable s
 
 Quality-diversity and evolutionary search are later clients of the same serialized programs and pure engine. A search genome may vary supported discrete tables, kernels, or continuous response parameters; fitness consumes explicit preserve, suppress, and ignore annotations plus separately reported behavioural metrics. Search returns reproducible candidate programs and numeric results, not a special runtime model.
 
-Model composition is also deferred. It operates on projections from validated results and never injects one modality into another modality's in-progress state. Composition provenance records every source result and operation.
+Boolean mask composition is implemented for completed Inspect and Lab results. It operates on projections and never injects one modality into another modality's in-progress state. Recipes record each source configuration, target generation, and operation. Composition of temporal projections remains future work.
 
 ## Proposed core interfaces
 

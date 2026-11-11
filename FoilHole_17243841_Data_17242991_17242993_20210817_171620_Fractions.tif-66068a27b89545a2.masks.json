@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "frame": {
+    "source": {
+      "path": "/home/jono/projects/vcem/data/raw/motion-corrected/AAG-MC_mics/FoilHole_17243841_Data_17242991_17242993_20210817_171620_Fractions.tif",
+      "bytes": 57191953,
+      "modified_seconds": 1649196000,
+      "modified_nanos": 0
+    },
+    "size": [
+      1024,
+      1024
+    ],
+    "rotation": "none",
+    "downsampling": "area_average"
+  },
+  "layers": [],
+  "regions": []
+}

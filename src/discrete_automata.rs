@@ -11,6 +11,10 @@ use std::{
     },
 };
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 pub const DISCRETE_PROGRAM_VERSION: u32 = 1;
 pub const DISCRETE_RUN_CONFIG_VERSION: u32 = 1;
 pub const DISCRETE_RESULT_VERSION: u32 = 1;
@@ -212,11 +216,38 @@ impl CompactState {
 pub struct KernelOffset {
     pub dx: i32,
     pub dy: i32,
+    /// Negative samples reverse the discrete state order: q - 1 - state.
+    /// Omitted polarity preserves all existing positive-only programs.
+    #[serde(default, skip_serializing_if = "SamplePolarity::is_positive")]
+    pub polarity: SamplePolarity,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplePolarity {
+    #[default]
+    Positive,
+    Negative,
+}
+impl SamplePolarity {
+    fn is_positive(&self) -> bool {
+        *self == Self::Positive
+    }
+    pub fn apply(self, state: u32, state_count: u32) -> u32 {
+        match self {
+            Self::Positive => state,
+            Self::Negative => state_count - 1 - state,
+        }
+    }
 }
 
 impl KernelOffset {
     pub const fn new(dx: i32, dy: i32) -> Self {
-        Self { dx, dy }
+        Self {
+            dx,
+            dy,
+            polarity: SamplePolarity::Positive,
+        }
     }
 }
 
@@ -308,6 +339,8 @@ pub struct DiscreteProgram {
     /// Stable sample order. For ordered rules, offset zero is the least
     /// significant base-q digit.
     pub kernel: Vec<KernelOffset>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub omni_directional: bool,
     pub boundary: BoundaryPolicy,
     pub rule: DiscreteRule,
 }
@@ -397,6 +430,7 @@ pub struct DiscreteSimulationResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiscreteAutomataError {
+    KernelRotationOverflow,
     UnsupportedProgramVersion {
         found: u32,
     },
@@ -470,6 +504,9 @@ pub enum DiscreteAutomataError {
 impl fmt::Display for DiscreteAutomataError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::KernelRotationOverflow => {
+                write!(formatter, "Kernel offsets are too large to rotate.")
+            }
             Self::UnsupportedProgramVersion { found } => {
                 write!(formatter, "Unsupported discrete program version {found}.")
             }
@@ -660,6 +697,7 @@ pub struct CompiledDiscreteAutomaton {
     state_count: u32,
     storage: StateStorage,
     kernel: Arc<Vec<KernelOffset>>,
+    orientations: Arc<Vec<Vec<KernelOffset>>>,
     boundary: BoundaryPolicy,
     rule: CompiledRule,
 }
@@ -744,6 +782,10 @@ pub fn compile_discrete_program(
     Ok(CompiledDiscreteAutomaton {
         state_count,
         storage: expected_storage,
+        orientations: Arc::new(kernel_orientations(
+            &program.kernel,
+            program.omni_directional,
+        )?),
         kernel: Arc::new(program.kernel),
         boundary: program.boundary,
         rule,
@@ -805,7 +847,7 @@ fn validate_discrete_program_inner(
                 .saturating_mul(size_of::<(KernelOffset, usize)>()),
         })?;
     for (index, offset) in program.kernel.iter().copied().enumerate() {
-        if let Some(first_index) = offset_indices.insert(offset, index) {
+        if let Some(first_index) = offset_indices.insert((offset.dx, offset.dy), index) {
             return Err(DiscreteAutomataError::DuplicateKernelOffset {
                 first_index,
                 duplicate_index: index,
@@ -814,6 +856,14 @@ fn validate_discrete_program_inner(
         }
     }
 
+    if program.omni_directional
+        && program
+            .kernel
+            .iter()
+            .any(|k| k.dx == i32::MIN || k.dy == i32::MIN)
+    {
+        return Err(DiscreteAutomataError::KernelRotationOverflow);
+    }
     let kernel_len = program.kernel.len();
     match &program.rule {
         DiscreteRule::Direct { table } => {
@@ -1296,7 +1346,7 @@ fn run_typed<T: Symbol>(
             width,
             height,
             automaton.state_count,
-            automaton.kernel.as_slice(),
+            automaton.orientations.as_slice(),
             automaton.boundary,
             rule,
             generation >= 2,
@@ -1353,7 +1403,7 @@ fn run_typed<T: Symbol>(
                     width,
                     height,
                     automaton.state_count,
-                    automaton.kernel.as_slice(),
+                    automaton.orientations.as_slice(),
                     automaton.boundary,
                     rule,
                     false,
@@ -1390,6 +1440,80 @@ fn run_typed<T: Symbol>(
     ))
 }
 
+pub(crate) fn kernel_orientations(
+    kernel: &[KernelOffset],
+    omni: bool,
+) -> Result<Vec<Vec<KernelOffset>>, DiscreteAutomataError> {
+    let mut result = vec![kernel.to_vec()];
+    if omni {
+        let mut rotated = kernel.to_vec();
+        for _ in 0..3 {
+            for offset in &mut rotated {
+                let x = offset
+                    .dy
+                    .checked_neg()
+                    .ok_or(DiscreteAutomataError::KernelRotationOverflow)?;
+                offset.dy = offset.dx;
+                offset.dx = x;
+            }
+            // Preserve sample order: it is significant for ordered rules.
+            if !result.contains(&rotated) {
+                result.push(rotated.clone());
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregate_index<T: Symbol>(
+    current: &[T],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    state_count: u32,
+    kernel: &[KernelOffset],
+    boundary: BoundaryPolicy,
+    reducer: AggregateReducer,
+) -> usize {
+    let sum = kernel.iter().fold(0_u128, |sum, offset| {
+        sum + offset.polarity.apply(
+            sample_state(current, width, height, x, y, *offset, boundary),
+            state_count,
+        ) as u128
+    });
+    match reducer {
+        AggregateReducer::Sum => sum as usize,
+        AggregateReducer::RoundedMean => {
+            let count = kernel.len() as u128;
+            ((sum * 2 + count) / (count * 2)) as usize
+        }
+    }
+}
+
+/// Shared by candidate fitting and the engine, including signs and boundaries.
+pub(crate) fn aggregate_sum_at(
+    current: &[u32],
+    size: [usize; 2],
+    position: [usize; 2],
+    state_count: u32,
+    kernel: &[KernelOffset],
+    boundary: BoundaryPolicy,
+) -> usize {
+    aggregate_index(
+        current,
+        size[0],
+        size[1],
+        position[0],
+        position[1],
+        state_count,
+        kernel,
+        boundary,
+        AggregateReducer::Sum,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn step_typed<T: Symbol>(
     current: &[T],
@@ -1397,104 +1521,93 @@ fn step_typed<T: Symbol>(
     width: usize,
     height: usize,
     state_count: u32,
-    kernel: &[KernelOffset],
+    orientations: &[Vec<KernelOffset>],
     boundary: BoundaryPolicy,
     rule: TypedRule<'_, T>,
     compare_two_generations_back: bool,
 ) -> StepStats {
-    match rule {
-        TypedRule::Direct { table } => step_cells(
-            current,
-            next,
-            width,
-            compare_two_generations_back,
-            |_, _, index| table[current[index].to_u32() as usize],
-        ),
-        TypedRule::Aggregate { reducer, table } => step_cells(
-            current,
-            next,
-            width,
-            compare_two_generations_back,
-            |x, y, _| {
-                let sum = kernel.iter().fold(0_u128, |sum, offset| {
-                    sum + sample_state(current, width, height, x, y, *offset, boundary) as u128
-                });
-                let table_index = match reducer {
-                    AggregateReducer::RoundedMean => {
-                        let count = kernel.len() as u128;
-                        ((sum * 2 + count) / (count * 2)) as usize
+    step_cells(
+        current,
+        next,
+        width,
+        compare_two_generations_back,
+        |x, y, index| {
+            if let TypedRule::Direct { table } = rule {
+                return table[current[index].to_u32() as usize];
+            }
+            orientations
+                .iter()
+                .map(|kernel| match rule {
+                    TypedRule::Direct { .. } => unreachable!(),
+                    TypedRule::Aggregate { reducer, table } => {
+                        table[aggregate_index(
+                            current,
+                            width,
+                            height,
+                            x,
+                            y,
+                            state_count,
+                            kernel,
+                            boundary,
+                            reducer,
+                        )]
                     }
-                    AggregateReducer::Sum => sum as usize,
-                };
-                table[table_index]
-            },
-        ),
-        TypedRule::OrderedNeighborhood { table } => {
-            let state_count =
-                usize::try_from(state_count).expect("compiled discrete state count is addressable");
-            step_cells(
-                current,
-                next,
-                width,
-                compare_two_generations_back,
-                |x, y, _| {
-                    let mut table_index = 0_usize;
-                    let mut multiplier = 1_usize;
-                    for (sample_index, offset) in kernel.iter().enumerate() {
-                        let value =
-                            sample_state(current, width, height, x, y, *offset, boundary) as usize;
-                        table_index += value * multiplier;
-                        if sample_index + 1 < kernel.len() {
-                            multiplier *= state_count;
+                    TypedRule::OrderedNeighborhood { table } => {
+                        let mut table_index = 0usize;
+                        let mut multiplier = 1usize;
+                        for (i, offset) in kernel.iter().enumerate() {
+                            let value = offset.polarity.apply(
+                                sample_state(current, width, height, x, y, *offset, boundary),
+                                state_count,
+                            );
+                            table_index += value as usize * multiplier;
+                            if i + 1 < kernel.len() {
+                                multiplier *= state_count as usize;
+                            }
                         }
+                        table[table_index]
                     }
-                    table[table_index]
-                },
-            )
-        }
-        TypedRule::PresenceTriggered {
-            transitions,
-            reduction,
-            fallback,
-        } => step_cells(
-            current,
-            next,
-            width,
-            compare_two_generations_back,
-            |x, y, index| {
-                let mut selected = None::<PresenceTransition>;
-                for offset in kernel {
-                    let sensed = sample_state(current, width, height, x, y, *offset, boundary);
-                    if let Ok(transition_index) = transitions
-                        .binary_search_by_key(&sensed, |transition| transition.trigger_state)
-                    {
-                        let transition = transitions[transition_index];
-                        selected = Some(match (selected, reduction) {
-                            (None, _) => transition,
-                            (Some(previous), PresenceReduction::LowestTrigger) => {
-                                if transition.trigger_state < previous.trigger_state {
-                                    transition
-                                } else {
-                                    previous
-                                }
+                    TypedRule::PresenceTriggered {
+                        transitions,
+                        reduction,
+                        fallback,
+                    } => {
+                        let mut selected = None::<PresenceTransition>;
+                        for offset in kernel {
+                            let sensed = offset.polarity.apply(
+                                sample_state(current, width, height, x, y, *offset, boundary),
+                                state_count,
+                            );
+                            if let Ok(i) =
+                                transitions.binary_search_by_key(&sensed, |t| t.trigger_state)
+                            {
+                                let transition = transitions[i];
+                                selected = Some(match (selected, reduction) {
+                                    (None, _) => transition,
+                                    (Some(previous), PresenceReduction::LowestTrigger)
+                                        if previous.trigger_state < transition.trigger_state =>
+                                    {
+                                        previous
+                                    }
+                                    (Some(previous), PresenceReduction::HighestTrigger)
+                                        if previous.trigger_state > transition.trigger_state =>
+                                    {
+                                        previous
+                                    }
+                                    _ => transition,
+                                });
                             }
-                            (Some(previous), PresenceReduction::HighestTrigger) => {
-                                if transition.trigger_state > previous.trigger_state {
-                                    transition
-                                } else {
-                                    previous
-                                }
-                            }
-                        });
+                        }
+                        selected.map_or_else(
+                            || fallback[current[index].to_u32() as usize],
+                            |t| T::from_u32(t.output_state),
+                        )
                     }
-                }
-                selected.map_or_else(
-                    || fallback[current[index].to_u32() as usize],
-                    |transition| T::from_u32(transition.output_state),
-                )
-            },
-        ),
-    }
+                })
+                .max_by_key(|v| v.to_u32())
+                .expect("compiled kernel has an orientation")
+        },
+    )
 }
 
 fn step_cells<T: Symbol>(
@@ -1644,6 +1757,126 @@ fn try_vec_with_capacity<T>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn signed_samples_reverse_states_for_all_neighbourhood_rules_and_preserve_old_json() {
+        let old: KernelOffset = serde_json::from_str(r#"{"dx":0,"dy":0}"#).unwrap();
+        assert_eq!(old.polarity, SamplePolarity::Positive);
+        assert!(!serde_json::to_string(&old).unwrap().contains("polarity"));
+        let negative = KernelOffset {
+            polarity: SamplePolarity::Negative,
+            ..old
+        };
+        for rule in [
+            DiscreteRule::Aggregate {
+                reducer: AggregateReducer::Sum,
+                table: packed(vec![0, 1, 2], 3),
+            },
+            DiscreteRule::Aggregate {
+                reducer: AggregateReducer::RoundedMean,
+                table: packed(vec![0, 1, 2], 3),
+            },
+            DiscreteRule::OrderedNeighborhood {
+                table: packed(vec![0, 1, 2], 3),
+            },
+            DiscreteRule::PresenceTriggered {
+                transitions: vec![
+                    PresenceTransition {
+                        trigger_state: 0,
+                        output_state: 0,
+                    },
+                    PresenceTransition {
+                        trigger_state: 1,
+                        output_state: 1,
+                    },
+                    PresenceTransition {
+                        trigger_state: 2,
+                        output_state: 2,
+                    },
+                ],
+                reduction: PresenceReduction::LowestTrigger,
+                fallback: packed(vec![0, 0, 0], 3),
+            },
+        ] {
+            let automaton = compiled(program(3, vec![negative], BoundaryPolicy::Wrap, rule));
+            assert_eq!(
+                values(&run(&automaton, vec![0, 1, 2], 3, 1, 1).final_state),
+                vec![2, 1, 0]
+            );
+        }
+        let duplicate = program(
+            3,
+            vec![old, negative],
+            BoundaryPolicy::Wrap,
+            DiscreteRule::Aggregate {
+                reducer: AggregateReducer::RoundedMean,
+                table: packed(vec![0, 1, 2], 3),
+            },
+        );
+        assert!(compile_discrete_program(duplicate, CompileLimits::default()).is_err());
+    }
+
+    #[test]
+    fn omni_directional_uses_the_maximum_mapped_state_each_generation() {
+        let kernel = vec![
+            KernelOffset::new(1, 0),
+            KernelOffset {
+                dx: 0,
+                dy: 1,
+                polarity: SamplePolarity::Negative,
+            },
+        ];
+        let rule = DiscreteRule::OrderedNeighborhood {
+            table: packed(vec![0, 2, 1, 1, 0, 2, 2, 1, 0], 3),
+        };
+        let mut definition = program(3, kernel.clone(), BoundaryPolicy::Wrap, rule.clone());
+        let old = serde_json::to_string(&definition).unwrap();
+        assert!(!old.contains("omni_directional"));
+        assert!(
+            !serde_json::from_str::<DiscreteProgram>(&old)
+                .unwrap()
+                .omni_directional
+        );
+        definition.omni_directional = true;
+        let definition: DiscreteProgram =
+            serde_json::from_str(&serde_json::to_string(&definition).unwrap()).unwrap();
+        let omni = compiled(definition);
+        let input = vec![0, 0, 1, 2, 1, 0, 2, 0, 1];
+        let mut expected = input.clone();
+        for _ in 0..2 {
+            let outputs: Vec<_> = kernel_orientations(&kernel, true)
+                .unwrap()
+                .into_iter()
+                .map(|k| {
+                    values(
+                        &run(
+                            &compiled(program(3, k, BoundaryPolicy::Wrap, rule.clone())),
+                            expected.clone(),
+                            3,
+                            3,
+                            1,
+                        )
+                        .final_state,
+                    )
+                })
+                .collect();
+            expected = (0..9)
+                .map(|i| outputs.iter().map(|o| o[i]).max().unwrap())
+                .collect();
+        }
+        assert_eq!(values(&run(&omni, input, 3, 3, 2).final_state), expected);
+        let mut invalid = program(
+            2,
+            vec![KernelOffset::new(i32::MIN, 0)],
+            BoundaryPolicy::Clamp,
+            DiscreteRule::Aggregate {
+                reducer: AggregateReducer::RoundedMean,
+                table: packed(vec![0, 1], 2),
+            },
+        );
+        invalid.omni_directional = true;
+        assert!(validate_discrete_program(&invalid, CompileLimits::default()).is_err());
+    }
+
     fn packed(values: impl Into<Vec<u32>>, state_count: u32) -> CompactState {
         CompactState::pack(values.into(), state_count).unwrap()
     }
@@ -1655,6 +1888,7 @@ mod tests {
         rule: DiscreteRule,
     ) -> DiscreteProgram {
         DiscreteProgram {
+            omni_directional: false,
             version: DISCRETE_PROGRAM_VERSION,
             state_count,
             storage: StateStorage::for_state_count(state_count).unwrap(),

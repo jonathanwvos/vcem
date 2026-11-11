@@ -68,6 +68,9 @@ impl Default for MaskUi {
     }
 }
 impl MaskUi {
+    pub(super) fn suggest_name(&mut self, name: String) {
+        self.name = name;
+    }
     pub(super) fn is_busy(&self) -> bool {
         self.job.is_some()
     }
@@ -171,6 +174,47 @@ impl MaskUi {
         self.dirty = true;
         Ok(())
     }
+    fn capture_lab(
+        &mut self,
+        configuration: ExperimentConfiguration,
+        model: &LabModelSettings,
+        lab: &AutomataLabSession,
+    ) -> Result<(), String> {
+        let frame = self.frame.as_ref().ok_or("Load an image first.")?;
+        if masks::SourceStamp::read(&frame.source.path)? != frame.source {
+            return Err("The source image changed. Reload it first.".into());
+        }
+        if model.program_document(lab.calibration())? != *lab.program_document() {
+            return Err("Lab settings do not match the applied run.".into());
+        }
+        let retained: usize = self
+            .sessions
+            .values()
+            .map(MaskSession::activation_bytes)
+            .sum();
+        if retained + frame.pixel_count()? * 4 > MAX_CAPTURED_BYTES {
+            return Err("Captured-mask memory limit reached (256 MiB).".into());
+        }
+        let experiment = LabExperimentConfiguration {
+            schema_version: 1,
+            preprocessing: configuration,
+            automaton: model.clone(),
+            generations: lab.generation(),
+        };
+        let result = crate::lab_configuration::snapshot_result(lab)?;
+        let session = self.sessions.get_mut(&frame.source.path).unwrap();
+        let id = session.capture_lab(frame, self.name.clone(), experiment, result)?;
+        self.left.get_or_insert(id);
+        self.right = Some(id);
+        self.preview = Preview::Layer(id);
+        self.name = format!("Layer {}", session.document.layers.len() + 1);
+        self.dirty = true;
+        self.notice = Some(format!(
+            "Captured Lab generation {} with its image preparation and automaton.",
+            lab.generation()
+        ));
+        Ok(())
+    }
     fn combine(&mut self, invert: bool) -> Result<(), String> {
         if !self.compatible() {
             return Err("Rebuild layers for this view first.".to_owned());
@@ -212,7 +256,12 @@ impl MaskUi {
         let new_bytes = document
             .layers
             .iter()
-            .filter(|layer| matches!(layer.source, LayerSource::Ca { .. }))
+            .filter(|layer| {
+                matches!(
+                    layer.source,
+                    LayerSource::Ca { .. } | LayerSource::Lab { .. }
+                )
+            })
             .count()
             * document.frame.pixel_count()?
             * std::mem::size_of::<f32>();
@@ -290,6 +339,11 @@ impl MaskUi {
             }
         }
         let json = serde_json::to_string_pretty(document).map_err(|e| e.to_string())?;
+        if json.len() as u64 > MAX_RECIPE_BYTES {
+            return Err(
+                "Mask recipe is too large. Remove unused layers or reduce rule tables.".into(),
+            );
+        }
         fs::write(path, json).map_err(|e| format!("Could not save mask recipe: {e}"))
     }
     fn load(&mut self, ctx: &egui::Context) -> Result<(), String> {
@@ -394,6 +448,8 @@ impl MaskUi {
         busy: bool,
         configuration: ExperimentConfiguration,
         result: Option<&CellularAutomataResult>,
+        lab: Option<(&LabModelSettings, &AutomataLabSession)>,
+        lab_mode: bool,
     ) {
         if self.frame.is_none() {
             ui.label("Load an image to create masks.");
@@ -433,7 +489,15 @@ impl MaskUi {
                 self.notice = Some("Started a new mask workspace for the current image.".to_owned());
             }
             ui.text_edit_singleline(&mut self.name).on_hover_text("Name for the next captured or combined layer.");
-            if ui.add_enabled(compatible && result.is_some(), Button::new("Capture current CA as layer")).clicked() {
+            if lab_mode {
+                if ui.add_enabled(compatible && lab.is_some(), Button::new("Capture Lab state as layer")).clicked() {
+                    if let Some((model, session)) = lab {
+                        if let Err(e) = self.capture_lab(configuration.clone(), model, session) { self.notice = Some(e); }
+                    }
+                }
+                ui.small("Pause playback to capture. Discrete mask activation = state / (state count − 1).");
+            }
+            if !lab_mode && ui.add_enabled(compatible && result.is_some(), Button::new("Capture current CA as layer")).clicked() {
                 if let Some(result) = result {
                     if let Err(e) = self.capture(configuration.clone(), result.clone()) { self.notice = Some(e); }
                 }
@@ -450,7 +514,7 @@ impl MaskUi {
                             if ui.small_button("×").on_hover_text("Remove this layer; referenced layers must be removed last.").clicked() { remove = Some(layer.id); }
                         });
                         match &mut layer.source {
-                            LayerSource::Ca { threshold, .. } => {
+                            LayerSource::Ca { threshold, .. } | LayerSource::Lab { threshold, .. } => {
                                 if ui.add(egui::Slider::new(threshold, 0.0..=1.0).text("Mask threshold").max_decimals(3)).changed() { self.dirty = true; }
                             }
                             LayerSource::Combine { left, operation, right } => { ui.small(format!("#{left} {} #{right}", operation.label())); }
@@ -495,7 +559,7 @@ impl MaskUi {
             if self.preview == Preview::Compare {
                 ui.colored_label(Color32::from_rgb(30,210,190), "A only");
                 ui.colored_label(Color32::from_rgb(220,90,190), "B only");
-                ui.colored_label(Color32::from_rgb(255,185,50), "A AND B — inspect before subtraction");
+                ui.colored_label(Color32::from_rgb(100,140,255), "A AND B — inspect before subtraction");
             }
             ui.collapsing("Review regions", |ui| {
                 ui.add_enabled(compatible, egui::Checkbox::new(&mut self.draw_regions,"Draw review regions"));
@@ -634,7 +698,18 @@ impl VCEMApp {
                 ui.label("Wait for the selected image to load.");
                 return;
             }
-            let configuration = self.applied_experiment_configuration();
+            let mut configuration = self.applied_experiment_configuration();
+            let lab_mode = self.view_mode == ViewMode::AutomataLab;
+            if lab_mode {
+                configuration.cellular_automata = None;
+                if let Some(displayed) = &self.displayed_image {
+                    configuration.histogram_bin_count = displayed.bin_count;
+                }
+            }
+            let lab = self
+                .lab_applied_model
+                .as_ref()
+                .zip(self.automata_lab_session.as_ref());
             self.masks.show(
                 ui,
                 busy,
@@ -642,6 +717,8 @@ impl VCEMApp {
                 self.displayed_image
                     .as_ref()
                     .and_then(|d| d.cellular_automata_result.as_ref()),
+                lab,
+                lab_mode,
             );
         });
     }
@@ -675,6 +752,92 @@ mod tests {
         }
         ui.refresh(ctx);
     }
+    #[test]
+    fn inspect_discrete_and_lenia_layers_combine_save_and_rebuild_together() {
+        let ctx = egui::Context::default();
+        let (path, configuration) = fixture("mixed-lab");
+        let (processed, frame) = masks::process_source(&path, &configuration).unwrap();
+        let mut ui = MaskUi::default();
+        ui.activate(frame.clone());
+        ui.capture(
+            configuration.clone(),
+            processed.cellular_automata_result.unwrap(),
+        )
+        .unwrap();
+        let mut preprocessing = configuration;
+        preprocessing.cellular_automata = None;
+        for model in [
+            LabModelSettings::Discrete(DiscreteLabSettings {
+                direct_table: vec![1, 0],
+                ..Default::default()
+            }),
+            LabModelSettings::Continuous(LeniaLabSettings::default()),
+        ] {
+            let experiment = LabExperimentConfiguration {
+                schema_version: 1,
+                preprocessing: preprocessing.clone(),
+                automaton: model.clone(),
+                generations: 2,
+            };
+            let mut lab = experiment
+                .initialize(
+                    &processed.prepared_values,
+                    processed.calibration,
+                    frame.size,
+                )
+                .unwrap();
+            lab.step(2).unwrap();
+            ui.capture_lab(preprocessing.clone(), &model, &lab).unwrap();
+        }
+        let session = ui.sessions.get_mut(&frame.source.path).unwrap();
+        let combination = session
+            .add_layer(
+                "Mixed intersection".into(),
+                LayerSource::Combine {
+                    left: 1,
+                    operation: MaskOperation::And,
+                    right: 2,
+                },
+            )
+            .unwrap();
+        session
+            .add_layer(
+                "Subtract Lenia".into(),
+                LayerSource::Combine {
+                    left: combination,
+                    operation: MaskOperation::Subtract,
+                    right: 3,
+                },
+            )
+            .unwrap();
+        let before = session.evaluate().unwrap();
+        assert_eq!(
+            before[&combination],
+            before[&1]
+                .iter()
+                .zip(&before[&2])
+                .map(|(a, b)| a & b)
+                .collect::<Vec<_>>()
+        );
+        ui.recipe_path = path
+            .parent()
+            .unwrap()
+            .join("mixed.json")
+            .display()
+            .to_string();
+        ui.save().unwrap();
+        ui.load(&ctx).unwrap();
+        finish(&mut ui, &ctx);
+        assert_eq!(before, ui.session().unwrap().evaluate().unwrap());
+        assert_eq!(ui.session().unwrap().document.schema_version, 2);
+        assert!(ui.session().unwrap().activation_bytes() > 0);
+        // Source-image version 1 recipes remain supported and upgrade on Lab capture.
+        let mut old = masks::MaskDocument::new(frame);
+        old.schema_version = 1;
+        old.validate().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn capture_save_rebuild_and_image_switch_preserve_independent_layers() {
         let ctx = egui::Context::default();
@@ -921,7 +1084,7 @@ mod tests {
             });
         masks.refresh(&ctx);
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            masks.show(ui, false, config.clone(), Some(&result));
+            masks.show(ui, false, config.clone(), Some(&result), None, false);
         });
         assert!(!output.shapes.is_empty());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();

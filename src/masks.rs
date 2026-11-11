@@ -1,5 +1,6 @@
 //! Image-bound mask recipes. Captured activations stay in memory; recipes can
 //! rebuild them from the source image without serializing millions of floats.
+use crate::lab_configuration::LabExperimentConfiguration;
 use crate::{
     analysis::processed_image_from_path,
     automata::{AutomataSimulationResult, CellularAutomataResult},
@@ -19,7 +20,7 @@ use std::{
 
 pub const MAX_LAYERS: usize = 16;
 pub const MAX_REGIONS: usize = 128;
-pub const MAX_RECIPE_BYTES: u64 = 1_048_576;
+pub const MAX_RECIPE_BYTES: u64 = 16 * 1_048_576;
 const MAX_PIXELS: usize = 1_048_576;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +125,10 @@ pub enum LayerSource {
         configuration: ExperimentConfiguration,
         threshold: f32,
     },
+    Lab {
+        experiment: LabExperimentConfiguration,
+        threshold: f32,
+    },
     Combine {
         left: u64,
         operation: MaskOperation,
@@ -136,7 +141,7 @@ pub enum LayerSource {
 impl LayerSource {
     fn references(&self, id: u64) -> bool {
         match self {
-            Self::Ca { .. } => false,
+            Self::Ca { .. } | Self::Lab { .. } => false,
             Self::Combine { left, right, .. } => *left == id || *right == id,
             Self::Invert { input } => *input == id,
         }
@@ -212,14 +217,14 @@ pub struct MaskDocument {
 impl MaskDocument {
     pub fn new(frame: MaskFrame) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             frame,
             layers: Vec::new(),
             regions: Vec::new(),
         }
     }
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             return Err("Unsupported mask recipe version.".to_owned());
         }
         self.frame.pixel_count()?;
@@ -248,6 +253,23 @@ impl MaskDocument {
                     }
                     if !threshold.is_finite() || !(0.0..=1.0).contains(threshold) {
                         return Err("Mask threshold must be between zero and one.".to_owned());
+                    }
+                }
+                LayerSource::Lab {
+                    experiment,
+                    threshold,
+                } => {
+                    if self.schema_version < 2 {
+                        return Err("Lab layers require mask recipe version 2.".into());
+                    }
+                    experiment.validate()?;
+                    if experiment.preprocessing.rotation != self.frame.rotation
+                        || experiment.preprocessing.downsampling != self.frame.downsampling
+                    {
+                        return Err("Lab layer coordinates do not match the mask recipe.".into());
+                    }
+                    if !threshold.is_finite() || !(0.0..=1.0).contains(threshold) {
+                        return Err("Mask threshold must be between zero and one.".into());
                     }
                 }
                 LayerSource::Combine { left, right, .. }
@@ -293,7 +315,12 @@ impl MaskDocument {
         }
         self.frame = target.clone();
         for layer in &mut self.layers {
-            if let LayerSource::Ca { configuration, .. } = &mut layer.source {
+            let configuration = match &mut layer.source {
+                LayerSource::Ca { configuration, .. } => Some(configuration),
+                LayerSource::Lab { experiment, .. } => Some(&mut experiment.preprocessing),
+                _ => None,
+            };
+            if let Some(configuration) = configuration {
                 configuration.rotation = target.rotation;
                 configuration.downsampling = target.downsampling;
             }
@@ -322,7 +349,12 @@ impl MaskSession {
                 AutomataSimulationResult::LegacyEvidenceGrowthV1(result) => {
                     result.state.len() * std::mem::size_of::<f32>()
                 }
-                _ => 0,
+                AutomataSimulationResult::DiscreteMapV1(result) => {
+                    result.final_state.byte_len().unwrap_or(usize::MAX)
+                }
+                AutomataSimulationResult::ContinuousLeniaV1(result) => {
+                    result.final_state.len() * std::mem::size_of::<f32>()
+                }
             })
             .sum()
     }
@@ -380,6 +412,50 @@ impl MaskSession {
         self.results.insert(id, result);
         Ok(id)
     }
+    pub fn capture_lab(
+        &mut self,
+        frame: &MaskFrame,
+        name: String,
+        experiment: LabExperimentConfiguration,
+        result: AutomataSimulationResult,
+    ) -> Result<u64, String> {
+        if frame != &self.document.frame {
+            return Err("Rebuild masks for the current view first.".into());
+        }
+        crate::automata_projection::validate_simulation_result(&result)
+            .map_err(|e| e.to_string())?;
+        let (size, generations, model_matches) = match (&result, &experiment.automaton) {
+            (
+                AutomataSimulationResult::DiscreteMapV1(r),
+                crate::lab_configuration::LabModelSettings::Discrete(s),
+            ) => (r.size, r.cycles_completed, r.state_count == s.state_count),
+            (
+                AutomataSimulationResult::ContinuousLeniaV1(r),
+                crate::lab_configuration::LabModelSettings::Continuous(_),
+            ) => (r.size, r.cycles_completed, true),
+            _ => return Err("Lab result and configuration model differ.".into()),
+        };
+        if size != frame.size || generations != experiment.generations || !model_matches {
+            return Err("Lab result does not match the captured configuration.".into());
+        }
+        let old_version = self.document.schema_version;
+        self.document.schema_version = 2;
+        let id = match self.add_layer(
+            name,
+            LayerSource::Lab {
+                experiment,
+                threshold: 0.1,
+            },
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                self.document.schema_version = old_version;
+                return Err(e);
+            }
+        };
+        self.results.insert(id, result);
+        Ok(id)
+    }
     pub fn remove(&mut self, id: u64) -> Result<(), String> {
         if self.document.layers.iter().any(|l| l.source.references(id)) {
             return Err("Remove combinations that reference this layer first.".to_owned());
@@ -393,7 +469,7 @@ impl MaskSession {
         let mut masks: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
         for layer in &self.document.layers {
             let mask = match &layer.source {
-                LayerSource::Ca { threshold, .. } => {
+                LayerSource::Ca { threshold, .. } | LayerSource::Lab { threshold, .. } => {
                     let result = self
                         .results
                         .get(&layer.id)
@@ -445,6 +521,20 @@ pub fn rebuild(
         if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("Mask rebuild cancelled.".to_owned());
         }
+        if let LayerSource::Lab { experiment, .. } = &layer.source {
+            let (image, frame) =
+                process_source(&document.frame.source.path, &experiment.preprocessing)?;
+            if frame != document.frame {
+                return Err("Rebuilt Lab coordinates differ from the recipe.".into());
+            }
+            let result = experiment.run(
+                &image.prepared_values,
+                image.calibration,
+                frame.size,
+                cancelled,
+            )?;
+            results.insert(layer.id, result);
+        }
         if let LayerSource::Ca { configuration, .. } = &layer.source {
             let (image, frame) = process_source(&document.frame.source.path, configuration)?;
             if frame != document.frame {
@@ -463,12 +553,13 @@ pub fn rebuild(
 }
 
 pub fn overlap_rgba(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let [r, g, blue] = crate::types::MASK_OVERLAP_RGB;
     a.iter()
         .zip(b)
         .flat_map(|(a, b)| match (*a != 0, *b != 0) {
             (true, false) => [30, 210, 190, 170],
             (false, true) => [220, 90, 190, 170],
-            (true, true) => [255, 185, 50, 210],
+            (true, true) => [r, g, blue, 210],
             _ => [0, 0, 0, 0],
         })
         .collect()
@@ -743,7 +834,7 @@ mod tests {
     fn recipe_validation_rejects_bad_geometry_thresholds_and_versions() {
         let (session, _, _) = pair();
         let mut bad = session.document.clone();
-        bad.schema_version = 2;
+        bad.schema_version = 99;
         assert!(bad.validate().is_err());
         let mut bad = session.document.clone();
         bad.frame.size = [usize::MAX, 2];
@@ -782,7 +873,7 @@ mod tests {
         assert_eq!(
             overlap_rgba(&[0, 1, 0, 1], &[0, 0, 1, 1]),
             [
-                0, 0, 0, 0, 30, 210, 190, 170, 220, 90, 190, 170, 255, 185, 50, 210
+                0, 0, 0, 0, 30, 210, 190, 170, 220, 90, 190, 170, 100, 140, 255, 210
             ]
         );
         let region = ReviewRegion {

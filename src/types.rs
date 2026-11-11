@@ -1,3 +1,8 @@
+/// Shared CA overlay colour. Pixel selection uses amber instead.
+pub const CA_MASK_RGB: [u8; 3] = [30, 210, 190];
+pub const MASK_OVERLAP_RGB: [u8; 3] = [100, 140, 255];
+pub const PIXEL_SELECTION_RGB: [u8; 3] = [255, 184, 54];
+
 use eframe::egui::{ColorImage, TextureHandle, Vec2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

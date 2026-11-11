@@ -805,6 +805,7 @@ mod tests {
                 transition_model: AutomataModelDefinition::DiscreteMap(DiscreteMapProgram {
                     initializer: HistogramStateInitializer::identity(calibration, 2),
                     program: DiscreteProgram {
+                        omni_directional: false,
                         version: DISCRETE_PROGRAM_VERSION,
                         state_count: 2,
                         storage: StateStorage::U8,

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fmt,
@@ -34,9 +35,11 @@ use crate::{
 const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Editable Lenia controls. This is an authoring adapter rather than a second
-/// persisted program format: the Lab compiles the resulting shared program
-/// document and retains that document as the session identity.
-#[derive(Clone, Debug, PartialEq)]
+/// execution format: the Lab compiles the resulting shared program document
+/// and retains that document as the session identity. Saved Lab experiments
+/// retain these authoring controls so they can be edited and replayed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LeniaLabSettings {
     pub kernel_size: u32,
     pub kernel_ring_center: f32,
@@ -125,14 +128,18 @@ impl LeniaLabSettings {
 }
 
 /// Editable discrete-map controls. This is an authoring adapter rather than a
-/// second persisted program format: the Lab compiles the resulting shared
-/// program document and retains that document as the session identity. The
+/// separate execution format: the Lab compiles the resulting shared program
+/// document and retains that document as the session identity. Saved Lab
+/// experiments retain these authoring controls for editing and replay. The
 /// discrete Lab always uses an identity histogram initializer (bin count
 /// equal to state count); bin-merging initializers remain a later addition.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscreteLabSettings {
     pub state_count: u32,
     pub kernel: Vec<KernelOffset>,
+    #[serde(default)]
+    pub omni_directional: bool,
     pub boundary: BoundaryPolicy,
     pub rule_kind: DiscreteRuleKind,
     pub direct_table: Vec<u32>,
@@ -149,6 +156,7 @@ impl Default for DiscreteLabSettings {
         Self {
             state_count: 2,
             kernel: Vec::new(),
+            omni_directional: false,
             boundary: BoundaryPolicy::Wrap,
             rule_kind: DiscreteRuleKind::Direct,
             direct_table: vec![0, 1],
@@ -266,6 +274,7 @@ impl DiscreteLabSettings {
                     state_count: self.state_count,
                     storage,
                     kernel: self.kernel.clone(),
+                    omni_directional: self.omni_directional,
                     boundary: self.boundary,
                     rule: self.packed_rule()?,
                 },
@@ -1014,6 +1023,7 @@ mod tests {
                     bin_to_state: None,
                 },
                 program: DiscreteProgram {
+                    omni_directional: false,
                     version: DISCRETE_PROGRAM_VERSION,
                     state_count: 2,
                     storage: StateStorage::U8,
