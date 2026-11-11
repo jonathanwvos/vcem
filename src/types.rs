@@ -1,6 +1,18 @@
+/// Shared CA overlay colour. Pixel selection uses amber instead.
+pub const CA_MASK_RGB: [u8; 3] = [30, 210, 190];
+pub const MASK_OVERLAP_RGB: [u8; 3] = [100, 140, 255];
+pub const PIXEL_SELECTION_RGB: [u8; 3] = [255, 184, 54];
+
 use eframe::egui::{ColorImage, TextureHandle, Vec2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use crate::quantization::IntensityCalibration;
+
+pub use crate::automata::{
+    CellularAutomataResponse, CellularAutomataResult, CellularAutomataSeedMode,
+    CellularAutomataSettings, CellularAutomataSummary,
+};
 
 pub struct ImageFile {
     pub path: PathBuf,
@@ -11,95 +23,28 @@ pub struct DisplayedImage {
     pub image_index: usize,
     pub size: Vec2,
     pub texture: TextureHandle,
-    pub bin_indices: Vec<usize>,
+    pub prepared_values: Vec<u32>,
+    pub calibration: IntensityCalibration,
+    pub bin_indices: Vec<u32>,
     pub bin_count: usize,
     pub highlight_bins: Vec<usize>,
     pub highlight_texture: Option<TextureHandle>,
     pub cellular_automata_texture: Option<TextureHandle>,
     pub cellular_automata_summary: Option<CellularAutomataSummary>,
+    pub cellular_automata_result: Option<CellularAutomataResult>,
 }
 
 pub struct ProcessedImage {
     pub size: Vec2,
     pub color_image: ColorImage,
+    pub prepared_values: Vec<u32>,
+    pub calibration: IntensityCalibration,
     pub histogram: IntensityHistogram,
-    pub bin_indices: Vec<usize>,
+    pub bin_indices: Vec<u32>,
     pub bin_count: usize,
     pub cellular_automata_overlay: Option<ColorImage>,
     pub cellular_automata_summary: Option<CellularAutomataSummary>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CellularAutomataSeedMode {
-    Bright,
-    Dark,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CellularAutomataResponse {
-    Gaussian,
-    Band,
-    Threshold,
-    LowThreshold,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CellularAutomataSettings {
-    pub kernel_size: usize,
-    pub kernel: Vec<f32>,
-    pub seed_mode: CellularAutomataSeedMode,
-    #[serde(default)]
-    pub omni_directional: bool,
-    pub response: CellularAutomataResponse,
-    pub response_center: f32,
-    pub response_width: f32,
-    pub growth_rate: f32,
-    pub decay_rate: f32,
-    pub time_step: f32,
-    pub iterations: usize,
-}
-
-impl Default for CellularAutomataSettings {
-    fn default() -> Self {
-        let kernel_size = 7;
-        let radius = kernel_size as f32 / 2.0;
-        let center = (kernel_size / 2) as f32;
-        let kernel = (0..kernel_size * kernel_size)
-            .map(|index| {
-                let x = (index % kernel_size) as f32 - center;
-                let y = (index / kernel_size) as f32 - center;
-                if x * x + y * y <= radius * radius {
-                    1.0
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-
-        Self {
-            kernel_size,
-            kernel,
-            seed_mode: CellularAutomataSeedMode::Dark,
-            omni_directional: false,
-            response: CellularAutomataResponse::Gaussian,
-            response_center: 0.65,
-            response_width: 0.12,
-            growth_rate: 1.0,
-            decay_rate: 0.10,
-            time_step: 0.15,
-            iterations: 24,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct CellularAutomataSummary {
-    pub iterations_run: usize,
-    pub converged: bool,
-    pub mean_activation: f32,
-    pub active_fraction: f32,
+    pub cellular_automata_result: Option<CellularAutomataResult>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +85,8 @@ impl ImageRotation {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExperimentConfiguration {
     pub schema_version: u32,
+    #[serde(default = "DownsamplingMethod::legacy")]
+    pub downsampling: DownsamplingMethod,
     pub histogram_bin_count: usize,
     pub rotation: ImageRotation,
     pub denoise: Option<DenoiseSettings>,
@@ -153,6 +100,7 @@ impl Default for ExperimentConfiguration {
     fn default() -> Self {
         Self {
             schema_version: 1,
+            downsampling: DownsamplingMethod::default(),
             histogram_bin_count: 256,
             rotation: ImageRotation::None,
             denoise: None,
@@ -164,13 +112,117 @@ impl Default for ExperimentConfiguration {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownsamplingMethod {
+    /// Reproduce configurations saved before downsampling was selectable.
+    Legacy,
+    Nearest,
+    #[default]
+    AreaAverage,
+    Triangle,
+}
+
+impl DownsamplingMethod {
+    pub fn legacy() -> Self {
+        Self::Legacy
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "Original behavior (legacy)",
+            Self::Nearest => "Nearest neighbor",
+            Self::AreaAverage => "Area average",
+            Self::Triangle => "Triangle (bilinear)",
+        }
+    }
+
+    pub fn resolved(self, float_tiff: bool) -> Self {
+        match self {
+            Self::Legacy if float_tiff => Self::Nearest,
+            Self::Legacy => Self::Triangle,
+            method => method,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct IntensityHistogram {
     pub bins: Vec<u64>,
     pub min_value: u32,
     pub max_value: u32,
     pub pixel_count: u64,
+    pub calibration: IntensityCalibration,
     pub source_description: String,
+}
+
+pub fn validate_experiment_configuration(
+    configuration: &ExperimentConfiguration,
+) -> std::result::Result<(), String> {
+    if configuration.schema_version != 1 {
+        return Err(format!(
+            "Unsupported configuration schema version {}.",
+            configuration.schema_version
+        ));
+    }
+    if !(2..=4096).contains(&configuration.histogram_bin_count) {
+        return Err("Histogram bin count must be between 2 and 4096.".to_owned());
+    }
+    if let Some(denoise) = configuration.denoise
+        && !matches!(denoise.kernel_size, 3 | 5 | 7)
+    {
+        return Err("Denoising kernel size must be 3, 5, or 7.".to_owned());
+    }
+    if configuration
+        .equalization
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err("Equalization strength must be between 0 and 1.".to_owned());
+    }
+    if configuration
+        .gamma
+        .is_some_and(|value| !value.is_finite() || !(0.001..=4.0).contains(&value))
+    {
+        return Err("Gamma must be between 0.001 and 4.".to_owned());
+    }
+
+    if let Some(settings) = &configuration.cellular_automata {
+        if !(3..=15).contains(&settings.kernel_size)
+            || settings.kernel_size.is_multiple_of(2)
+            || settings.kernel.len() != settings.kernel_size * settings.kernel_size
+        {
+            return Err("Cellular kernel must be an odd square from 3 x 3 to 15 x 15.".to_owned());
+        }
+        if settings.kernel.iter().any(|weight| !weight.is_finite())
+            || !settings
+                .kernel
+                .iter()
+                .any(|weight| weight.abs() > f32::EPSILON)
+        {
+            return Err("Cellular kernel must contain finite, non-zero weights.".to_owned());
+        }
+        let scalar_values = [
+            settings.response_center,
+            settings.response_width,
+            settings.growth_rate,
+            settings.decay_rate,
+            settings.time_step,
+        ];
+        if scalar_values.iter().any(|value| !value.is_finite()) {
+            return Err("Cellular response and evolution values must be finite.".to_owned());
+        }
+        if !(-1.0..=1.0).contains(&settings.response_center)
+            || !(0.01..=1.0).contains(&settings.response_width)
+            || !(0.0..=2.0).contains(&settings.growth_rate)
+            || !(0.0..=2.0).contains(&settings.decay_rate)
+            || !(0.01..=0.5).contains(&settings.time_step)
+            || !(1..=128).contains(&settings.iterations)
+        {
+            return Err("Cellular settings fall outside the supported UI ranges.".to_owned());
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -178,9 +230,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn downsampling_defaults_and_saved_configurations_are_compatible() {
+        let configuration = ExperimentConfiguration::default();
+        assert_eq!(configuration.downsampling, DownsamplingMethod::AreaAverage);
+        let mut old_json = serde_json::to_value(&configuration).unwrap();
+        old_json.as_object_mut().unwrap().remove("downsampling");
+        let legacy: ExperimentConfiguration = serde_json::from_value(old_json.clone()).unwrap();
+        assert_eq!(legacy.downsampling, DownsamplingMethod::Legacy);
+        assert_eq!(
+            legacy.downsampling.resolved(true),
+            DownsamplingMethod::Nearest
+        );
+        assert_eq!(
+            legacy.downsampling.resolved(false),
+            DownsamplingMethod::Triangle
+        );
+
+        for method in [
+            DownsamplingMethod::Legacy,
+            DownsamplingMethod::Nearest,
+            DownsamplingMethod::AreaAverage,
+            DownsamplingMethod::Triangle,
+        ] {
+            let configuration = ExperimentConfiguration {
+                downsampling: method,
+                ..configuration.clone()
+            };
+            let json = serde_json::to_string(&configuration).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ExperimentConfiguration>(&json).unwrap(),
+                configuration
+            );
+        }
+        old_json["downsampling"] = serde_json::json!("unknown_filter");
+        assert!(serde_json::from_value::<ExperimentConfiguration>(old_json).is_err());
+    }
+
+    #[test]
     fn experiment_configuration_round_trips_through_json() {
         let configuration = ExperimentConfiguration {
             schema_version: 1,
+            downsampling: DownsamplingMethod::Triangle,
             histogram_bin_count: 512,
             rotation: ImageRotation::HalfTurn,
             denoise: Some(DenoiseSettings {

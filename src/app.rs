@@ -1,3 +1,12 @@
+mod candidates;
+mod kernel_editor;
+mod lab;
+mod masks;
+
+use crate::lab_configuration::{
+    LabExperimentConfiguration, LabModelSettings, MAX_AUTHORING_TABLE_LEN,
+};
+
 use eframe::{
     App, CreationContext, Frame,
     egui::{
@@ -10,18 +19,38 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
+    time::{Duration, Instant},
 };
 
-use crate::analysis::{intensity_histogram_from_path, processed_image_from_path};
+use crate::automata::{AutomataCompileLimits, AutomataModelDefinition, AutomataProgramDocument};
+use crate::automata_lab::{
+    AutomataLabSession, DiscreteLabSettings, LabCapturePolicy, LabDiagnostics, LabExecutionPolicy,
+    LabStateSnapshot, LabStepOutcome, LeniaLabSettings, resized_table,
+};
+use crate::automata_projection::{
+    NumericProjectionSpec, OUTPUT_PROJECTION_VERSION, OverlayProjectionSpec, ProjectionLimits,
+    ProjectionSource, ProjectionTransfer, project_continuous_state_overlay,
+    project_discrete_state_overlay,
+};
+use crate::continuous_automata::{ContinuousBoundaryPolicy, ContinuousDomain};
+use crate::discrete_automata::{
+    AggregateReducer, BoundaryPolicy, DiscreteRuleKind, KernelOffset, PresenceReduction,
+    PresenceTransition, SamplePolarity,
+};
 use crate::types::{
     CellularAutomataResponse, CellularAutomataSeedMode, CellularAutomataSettings, DenoiseMethod,
-    DenoiseSettings, DisplayedImage, ExperimentConfiguration, ImageFile, ImageRotation,
-    IntensityHistogram, ProcessedImage,
+    DenoiseSettings, DisplayedImage, DownsamplingMethod, ExperimentConfiguration, ImageFile,
+    ImageRotation, IntensityHistogram, ProcessedImage, validate_experiment_configuration,
 };
 
 pub struct VCEMApp {
+    masks: masks::MaskUi,
     upper_panel_expanded: bool,
     view_mode: ViewMode,
     images: Vec<ImageFile>,
@@ -36,7 +65,7 @@ pub struct VCEMApp {
     viewer_pan: Vec2,
     viewer_needs_fit: bool,
     picker_drag_selection: Option<bool>,
-    histogram_bin_count: usize,
+    histogram_bin_count: HistogramBinCountControl,
     histogram: Option<IntensityHistogram>,
     histogram_error: Option<String>,
     reset_histogram_view: bool,
@@ -44,6 +73,8 @@ pub struct VCEMApp {
     selected_histogram_bins: BTreeSet<usize>,
     image_selection_start: Option<Pos2>,
     histogram_selection_start_bin: Option<usize>,
+    downsampling: DownsamplingMethod,
+    applied_downsampling: DownsamplingMethod,
     rotation: ImageRotation,
     applied_rotation: ImageRotation,
     denoise_method: DenoiseMethod,
@@ -67,6 +98,38 @@ pub struct VCEMApp {
     configuration_error: Option<String>,
     processing_job: Option<ProcessingJob>,
     next_processing_job_id: u64,
+    automata_lab_settings: LeniaLabSettings,
+    automata_lab_discrete_settings: DiscreteLabSettings,
+    automata_lab_model_family: LabModelFamily,
+    automata_lab_kernel_grid_size: u32,
+    automata_lab_kernel_drag_brush: Option<CellularKernelBrush>,
+    automata_lab_kernel_brush: CellularKernelBrush,
+    lab_kernel_preset: CellularKernelPreset,
+    lab_kernel_angle: f32,
+    candidates: candidates::CandidateUi,
+    lab_random_seed: u64,
+    lab_random_density: f32,
+    lab_random_negative: f32,
+    lab_configuration_path: String,
+    lab_saved_configuration: Option<LabExperimentConfiguration>,
+    lab_pending_configuration: Option<LabExperimentConfiguration>,
+    lab_applied_model: Option<LabModelSettings>,
+    lab_replay_generations: Option<u32>,
+    automata_lab_presence_draft_trigger: u32,
+    automata_lab_presence_draft_output: u32,
+    automata_lab_execution_policy: LabExecutionPolicy,
+    automata_lab_capture_policy: LabCapturePolicy,
+    automata_lab_session: Option<AutomataLabSession>,
+    automata_lab_job: Option<AutomataLabJob>,
+    automata_lab_step_progress: Option<(u32, u32)>,
+    automata_lab_texture: Option<egui::TextureHandle>,
+    automata_lab_playing: bool,
+    automata_lab_steps_per_second: f32,
+    automata_lab_cycles_per_step: u32,
+    automata_lab_last_step: Instant,
+    automata_lab_bookmark_name: String,
+    automata_lab_error: Option<String>,
+    automata_lab_notice: Option<String>,
 }
 
 struct ImageCandidate {
@@ -83,17 +146,49 @@ struct ProcessingJob {
     kind: ProcessingKind,
 }
 
+struct AutomataLabJob {
+    receiver: Receiver<AutomataLabStepUpdate>,
+    cancellation: Arc<AtomicBool>,
+    discard_result: bool,
+}
+
+/// The step worker reports one generation at a time so the overlay can
+/// animate live and the UI can show real progress, instead of a single
+/// request/spinner/result round trip for a multi-cycle step.
+///
+/// `Progress` carries only a cheap state snapshot, not a full session clone:
+/// `AutomataLabSession::checkpoints`/`bookmarks` are not Arc-wrapped, so
+/// cloning the whole session on every single generation (rather than once
+/// per UI-level step) made its cost grow with total checkpoint history,
+/// which grows unboundedly over a long Play session. Only `Done` clones the
+/// full session, once per step call.
+enum AutomataLabStepUpdate {
+    Progress {
+        state: LabStateSnapshot,
+        generation: u32,
+        diagnostics: Option<LabDiagnostics>,
+        cycles_completed: u32,
+        cycles_total: u32,
+    },
+    Done {
+        session: Box<AutomataLabSession>,
+        outcome: LabStepOutcome,
+    },
+    Failed(String),
+}
+
 struct ProcessingResult {
     id: u64,
     image_index: usize,
     image_name: String,
     kind: ProcessingKind,
-    result: std::result::Result<ProcessedImage, String>,
+    result: std::result::Result<(ProcessedImage, crate::masks::MaskFrame), String>,
 }
 
 #[derive(Clone)]
 enum ProcessingKind {
     Preview(ExperimentConfiguration),
+    Downsampling(ExperimentConfiguration),
     Rotation(ExperimentConfiguration),
     Denoise(ExperimentConfiguration),
     Invert(ExperimentConfiguration),
@@ -132,10 +227,61 @@ enum ViewMode {
     Inspect,
     Segment,
     Measure,
+    AutomataLab,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LabModelFamily {
+    Discrete,
+    Continuous,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscreteTableTarget {
+    Direct,
+    Aggregate,
+    Ordered,
+    PresenceFallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistogramBinCountControl {
+    applied: usize,
+    draft: usize,
+}
+
+impl HistogramBinCountControl {
+    fn new(value: usize) -> Self {
+        Self {
+            applied: value,
+            draft: value,
+        }
+    }
+
+    fn applied(self) -> usize {
+        self.applied
+    }
+
+    fn draft_mut(&mut self) -> &mut usize {
+        &mut self.draft
+    }
+
+    fn commit(&mut self) {
+        self.applied = self.draft;
+    }
+
+    fn set(&mut self, value: usize) {
+        self.applied = value;
+        self.draft = value;
+    }
 }
 
 impl VCEMApp {
     pub fn new(_: &CreationContext<'_>) -> Self {
+        Self::initial_state()
+    }
+
+    fn initial_state() -> Self {
         let current_dir = std::env::current_dir().unwrap_or_default();
         let image_picker_dir = current_dir.display().to_string();
         let configuration_path = current_dir
@@ -144,6 +290,7 @@ impl VCEMApp {
             .to_string();
 
         Self {
+            masks: masks::MaskUi::default(),
             upper_panel_expanded: true,
             view_mode: ViewMode::Inspect,
             images: Vec::new(),
@@ -158,7 +305,7 @@ impl VCEMApp {
             viewer_pan: Vec2::ZERO,
             viewer_needs_fit: true,
             picker_drag_selection: None,
-            histogram_bin_count: 256,
+            histogram_bin_count: HistogramBinCountControl::new(256),
             histogram: None,
             histogram_error: None,
             reset_histogram_view: false,
@@ -166,6 +313,8 @@ impl VCEMApp {
             selected_histogram_bins: BTreeSet::new(),
             image_selection_start: None,
             histogram_selection_start_bin: None,
+            downsampling: DownsamplingMethod::default(),
+            applied_downsampling: DownsamplingMethod::default(),
             rotation: ImageRotation::None,
             applied_rotation: ImageRotation::None,
             denoise_method: DenoiseMethod::None,
@@ -189,6 +338,38 @@ impl VCEMApp {
             configuration_error: None,
             processing_job: None,
             next_processing_job_id: 1,
+            automata_lab_settings: LeniaLabSettings::default(),
+            automata_lab_discrete_settings: DiscreteLabSettings::default(),
+            automata_lab_model_family: LabModelFamily::Continuous,
+            automata_lab_kernel_grid_size: 3,
+            automata_lab_kernel_drag_brush: None,
+            automata_lab_kernel_brush: CellularKernelBrush::Positive,
+            lab_kernel_preset: CellularKernelPreset::Custom,
+            lab_kernel_angle: 0.0,
+            candidates: candidates::CandidateUi::default(),
+            lab_random_seed: 1,
+            lab_random_density: 0.25,
+            lab_random_negative: 0.5,
+            lab_configuration_path: current_dir.join("vcem-lab.json").display().to_string(),
+            lab_saved_configuration: None,
+            lab_pending_configuration: None,
+            lab_applied_model: None,
+            lab_replay_generations: None,
+            automata_lab_presence_draft_trigger: 0,
+            automata_lab_presence_draft_output: 0,
+            automata_lab_execution_policy: LabExecutionPolicy::default(),
+            automata_lab_capture_policy: LabCapturePolicy::default(),
+            automata_lab_session: None,
+            automata_lab_job: None,
+            automata_lab_step_progress: None,
+            automata_lab_texture: None,
+            automata_lab_playing: false,
+            automata_lab_steps_per_second: 10.0,
+            automata_lab_cycles_per_step: 1,
+            automata_lab_last_step: Instant::now(),
+            automata_lab_bookmark_name: "Bookmark 1".to_owned(),
+            automata_lab_error: None,
+            automata_lab_notice: None,
         }
     }
 
@@ -241,6 +422,12 @@ impl VCEMApp {
                             .clicked()
                         {
                             view_mode = ViewMode::Measure;
+                        }
+                        if ui
+                            .selectable_label(view_mode == ViewMode::AutomataLab, "Automata Lab")
+                            .clicked()
+                        {
+                            view_mode = ViewMode::AutomataLab;
                         }
                     });
                 } else {
@@ -299,6 +486,8 @@ impl VCEMApp {
 
                     if selected_image != self.selected_image {
                         self.selected_image = selected_image;
+                        self.candidates.invalidate();
+                        self.invalidate_automata_lab();
                         self.displayed_image = None;
                         self.viewer_error = None;
                         self.viewer_needs_fit = true;
@@ -306,6 +495,7 @@ impl VCEMApp {
                         self.histogram_error = None;
                         self.reset_histogram_view = true;
                         self.clear_histogram_highlight();
+                        self.downsampling = self.applied_downsampling;
                         self.applied_denoise = None;
                         self.invert_values = false;
                         self.applied_invert = false;
@@ -324,223 +514,276 @@ impl VCEMApp {
             });
     }
 
+    fn show_downsampling_controls(&mut self, ui: &mut Ui, is_processing: bool) {
+        ui.heading("Downsampling");
+        ui.separator();
+        ui.add_enabled_ui(!is_processing, |ui| {
+            egui::ComboBox::from_id_salt("downsampling_method")
+                .selected_text(self.downsampling.label())
+                .show_ui(ui, |ui| {
+                    if self.downsampling == DownsamplingMethod::Legacy {
+                        ui.selectable_value(&mut self.downsampling, DownsamplingMethod::Legacy, DownsamplingMethod::Legacy.label());
+                    }
+                    for method in [DownsamplingMethod::Nearest, DownsamplingMethod::AreaAverage, DownsamplingMethod::Triangle] {
+                        ui.selectable_value(&mut self.downsampling, method, method.label());
+                    }
+                }).response.on_hover_text("Changes the reduced image used by the viewer, histogram, and cellular automata.");
+            if ui.add_enabled(self.downsampling != self.applied_downsampling, Button::new("Apply Downsampling")).clicked() {
+                self.apply_downsampling(ui.ctx());
+            }
+        });
+        ui.small(format!("Applied: {}", self.applied_downsampling.label()));
+    }
+
+    fn apply_downsampling(&mut self, ctx: &egui::Context) {
+        let Some((image_index, path, name)) = self.selected_image.and_then(|index| {
+            self.images
+                .get(index)
+                .map(|image| (index, image.path.clone(), image.name.clone()))
+        }) else {
+            return;
+        };
+        self.viewer_error = None;
+        self.histogram_error = None;
+        let mut parameters = self.applied_experiment_configuration();
+        parameters.downsampling = self.downsampling;
+        self.start_processing_job(
+            ctx,
+            image_index,
+            path,
+            name,
+            ProcessingKind::Downsampling(parameters),
+        );
+    }
+
     fn show_right_panel(&mut self, ui: &mut Ui) {
+        if self.view_mode == ViewMode::AutomataLab {
+            self.show_automata_lab_right_panel(ui);
+            return;
+        }
         Panel::right("right_panel")
             .resizable(true)
             .default_size(240.0)
             .min_size(160.0)
             .show(ui, |ui| {
                 ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Analysis");
-                    ui.separator();
-
-                    if let Some(image) =
-                        self.selected_image.and_then(|index| self.images.get(index))
-                    {
-                        let is_processing = self.processing_job.is_some();
-
-                        ui.label(format!("File: {}", image.name));
-                        if let Some(displayed) = self
-                            .displayed_image
-                            .as_ref()
-                            .filter(|displayed| Some(displayed.image_index) == self.selected_image)
-                        {
-                            ui.label(format!(
-                                "Size: {} x {}",
-                                displayed.size.x as usize, displayed.size.y as usize
-                            ));
-                        } else {
-                            ui.label("Size: not loaded");
-                        }
-                        if let Some(job) = &self.processing_job {
-                            ui.label(format!("Processing {}...", job.kind.label()));
-                        }
-
-                        ui.add_space(5.0);
-                        ui.heading("Image Augmentations");
-                        ui.separator();
-                        if ui
-                            .add_enabled(
-                                self.has_image_augmentation_state() || is_processing,
-                                Button::new("Reset All Augmentations"),
-                            )
-                            .on_hover_text("Restores the current image to its unaugmented state.")
-                            .clicked()
-                        {
-                            self.reset_image_augmentations(ui.ctx());
-                        }
-
-                        ui.add_space(8.0);
-                        self.show_rotation_controls(ui, is_processing);
-
-                        ui.add_space(8.0);
-                        self.show_configuration_controls(ui, is_processing);
-
-                        ui.add_space(5.0);
-                        ui.heading("Intensity Histogram");
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Bin count");
-                            let response = ui.add(
-                                DragValue::new(&mut self.histogram_bin_count)
-                                    .range(2..=4096)
-                                    .speed(1),
-                            )
-                            .on_hover_text("Controls how finely intensities are divided into bins.");
-                            if response.changed() {
-                                self.displayed_image = None;
-                                self.histogram = None;
-                                self.histogram_error = None;
-                                self.clear_histogram_highlight();
-                                self.processing_job = None;
-                                self.reset_histogram_view = true;
-                            }
-                        });
-
-                        if ui
-                            .add_enabled(!is_processing, Button::new("Create Histogram"))
-                            .on_hover_text("Builds the intensity distribution for the current processed image.")
-                            .clicked()
-                        {
-                            self.create_intensity_histogram();
-                        }
-
-                        if let Some(error) = &self.histogram_error {
-                            ui.colored_label(ui.visuals().error_fg_color, error);
-                        }
-
-                        if let Some(histogram) = self.histogram.clone() {
-                            ui.label(format!(
-                                "{} pixels, {}, range {}..{}",
-                                histogram.pixel_count,
-                                histogram.source_description,
-                                histogram.min_value,
-                                histogram.max_value
-                            ));
-                            self.show_histogram_zoom_controls(ui, &histogram);
-                            self.show_histogram_plot(ui, &histogram);
-                        }
-
-                        ui.add_space(8.0);
-                        ui.heading("Denoising");
-                        ui.separator();
-                        egui::ComboBox::from_label("Method")
-                            .selected_text(self.denoise_method.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.denoise_method,
-                                    DenoiseMethod::None,
-                                    DenoiseMethod::None.label(),
-                                );
-                                ui.selectable_value(
-                                    &mut self.denoise_method,
-                                    DenoiseMethod::Median,
-                                    DenoiseMethod::Median.label(),
-                                );
-                                ui.selectable_value(
-                                    &mut self.denoise_method,
-                                    DenoiseMethod::Gaussian,
-                                    DenoiseMethod::Gaussian.label(),
-                                );
-                            })
-                            .response
-                            .on_hover_text("Chooses the local denoising operation to apply before later augmentations.");
-
-                        match self.denoise_method {
-                            DenoiseMethod::None => {
-                                ui.label("No denoising will be applied.");
-                            }
-                            DenoiseMethod::Median | DenoiseMethod::Gaussian => {
-                                ui.horizontal(|ui| {
-                                    ui.label("Kernel");
-                                    ui.selectable_value(&mut self.denoise_kernel_size, 3, "3")
-                                        .on_hover_text("Smallest denoise neighbourhood; preserves finer details.");
-                                    ui.selectable_value(&mut self.denoise_kernel_size, 5, "5")
-                                        .on_hover_text("Moderate denoise neighbourhood.");
-                                    ui.selectable_value(&mut self.denoise_kernel_size, 7, "7")
-                                        .on_hover_text("Largest denoise neighbourhood; smooths more aggressively.");
-                                });
-                            }
-                        }
-
-                        if ui
-                            .add_enabled(!is_processing, Button::new("Apply Denoising"))
-                            .on_hover_text("Applies the selected denoise method to the current image.")
-                            .clicked()
-                        {
-                            self.apply_denoising(ui.ctx());
-                        }
-
-                        ui.add_space(8.0);
-                        ui.heading("Inversion");
-                        ui.separator();
-                        ui.checkbox(&mut self.invert_values, "Invert values")
-                            .on_hover_text("Swaps low and high intensities before later processing.");
-                        if ui
-                            .add_enabled(
-                                !is_processing && self.invert_values != self.applied_invert,
-                                Button::new("Apply Inversion"),
-                            )
-                            .on_hover_text("Applies or removes intensity inversion.")
-                            .clicked()
-                        {
-                            self.apply_inversion(ui.ctx());
-                        }
-
-                        ui.add_space(8.0);
-                        ui.heading("Distribution Equalization");
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Strength");
-                            ui.add(
-                                egui::Slider::new(&mut self.equalization_strength, 0.0..=1.0)
-                                    .show_value(true),
-                            )
-                            .on_hover_text("Spreads occupied intensity values across more of the available range.");
-                        });
-                        if ui
-                            .add_enabled(
-                                !is_processing
-                                    && Some(self.equalization_strength)
-                                        != self.applied_equalization
-                                    && (self.equalization_strength > 0.0
-                                        || self.applied_equalization.is_some()),
-                                Button::new("Apply Equalization"),
-                            )
-                            .on_hover_text("Applies the selected distribution equalization strength.")
-                            .clicked()
-                        {
-                            self.apply_equalization(ui.ctx());
-                        }
-
-                        ui.add_space(8.0);
-                        ui.heading("Gamma Adjustment");
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Gamma");
-                            ui.add(
-                                DragValue::new(&mut self.gamma_value)
-                                    .range(0.001..=4.0)
-                                    .speed(0.01),
-                            )
-                            .on_hover_text("Adjusts contrast nonlinearly while preserving intensity ordering.");
-                        });
-
-                        if ui
-                            .add_enabled(!is_processing, Button::new("Apply Gamma Adjustment"))
-                            .on_hover_text("Applies the selected gamma value to the current image.")
-                            .clicked()
-                        {
-                            self.apply_gamma_adjustment(ui.ctx());
-                        }
-
-                        ui.add_space(8.0);
-                        self.show_cellular_automata_controls(ui, is_processing);
-                    } else {
-                        ui.label("Analytical results live here.");
+                    self.show_image_controls(ui);
+                    if self.displayed_image.is_some() {
+                        let busy = self.processing_job.is_some() || self.masks.is_busy();
+                        self.show_mask_controls(ui, busy);
+                        self.show_cellular_automata_controls(ui, busy);
                     }
                 });
             });
+    }
+
+    fn show_image_controls(&mut self, ui: &mut Ui) {
+        ui.heading("Analysis");
+        ui.separator();
+
+        if let Some(image) = self.selected_image.and_then(|index| self.images.get(index)) {
+            let is_processing = self.processing_job.is_some() || self.masks.is_busy();
+
+            ui.label(format!("File: {}", image.name));
+            if let Some(displayed) = self
+                .displayed_image
+                .as_ref()
+                .filter(|displayed| Some(displayed.image_index) == self.selected_image)
+            {
+                ui.label(format!(
+                    "Size: {} x {}",
+                    displayed.size.x as usize, displayed.size.y as usize
+                ));
+            } else {
+                ui.label("Size: not loaded");
+            }
+            if let Some(job) = &self.processing_job {
+                ui.label(format!("Processing {}...", job.kind.label()));
+            }
+
+            ui.add_space(5.0);
+            self.show_downsampling_controls(ui, is_processing);
+            ui.add_space(8.0);
+            ui.heading("Image Augmentations");
+            ui.separator();
+            if ui
+                .add_enabled(
+                    self.has_image_augmentation_state() || is_processing,
+                    Button::new("Reset All Augmentations"),
+                )
+                .on_hover_text("Restores the current image to its unaugmented state.")
+                .clicked()
+            {
+                self.reset_image_augmentations(ui.ctx());
+            }
+
+            ui.add_space(8.0);
+            self.show_rotation_controls(ui, is_processing);
+
+            ui.add_space(8.0);
+            if self.view_mode != ViewMode::AutomataLab {
+                self.show_configuration_controls(ui, is_processing);
+            }
+
+            ui.add_space(5.0);
+            ui.heading("Intensity Histogram");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Bin count");
+                ui.add_enabled(
+                    !is_processing,
+                    DragValue::new(self.histogram_bin_count.draft_mut())
+                        .range(2..=4096)
+                        .speed(1),
+                )
+                .on_hover_text("Controls how finely intensities are divided into bins.");
+            });
+
+            if ui
+                .add_enabled(!is_processing, Button::new("Create Histogram"))
+                .on_hover_text("Builds the intensity distribution for the current processed image.")
+                .clicked()
+            {
+                self.create_intensity_histogram(ui.ctx());
+            }
+
+            if let Some(error) = &self.histogram_error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+
+            if let Some(histogram) = self.histogram.clone() {
+                ui.label(format!(
+                    "{} pixels, {}, range {}..{}",
+                    histogram.pixel_count,
+                    histogram.source_description,
+                    histogram.min_value,
+                    histogram.max_value
+                ));
+                self.show_histogram_zoom_controls(ui, &histogram);
+                self.show_histogram_plot(ui, &histogram);
+            }
+
+            ui.add_space(8.0);
+            ui.heading("Denoising");
+            ui.separator();
+            egui::ComboBox::from_label("Method")
+                .selected_text(self.denoise_method.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.denoise_method,
+                        DenoiseMethod::None,
+                        DenoiseMethod::None.label(),
+                    );
+                    ui.selectable_value(
+                        &mut self.denoise_method,
+                        DenoiseMethod::Median,
+                        DenoiseMethod::Median.label(),
+                    );
+                    ui.selectable_value(
+                        &mut self.denoise_method,
+                        DenoiseMethod::Gaussian,
+                        DenoiseMethod::Gaussian.label(),
+                    );
+                })
+                .response
+                .on_hover_text(
+                    "Chooses the local denoising operation to apply before later augmentations.",
+                );
+
+            match self.denoise_method {
+                DenoiseMethod::None => {
+                    ui.label("No denoising will be applied.");
+                }
+                DenoiseMethod::Median | DenoiseMethod::Gaussian => {
+                    ui.horizontal(|ui| {
+                        ui.label("Kernel");
+                        ui.selectable_value(&mut self.denoise_kernel_size, 3, "3")
+                            .on_hover_text(
+                                "Smallest denoise neighbourhood; preserves finer details.",
+                            );
+                        ui.selectable_value(&mut self.denoise_kernel_size, 5, "5")
+                            .on_hover_text("Moderate denoise neighbourhood.");
+                        ui.selectable_value(&mut self.denoise_kernel_size, 7, "7")
+                            .on_hover_text(
+                                "Largest denoise neighbourhood; smooths more aggressively.",
+                            );
+                    });
+                }
+            }
+
+            if ui
+                .add_enabled(!is_processing, Button::new("Apply Denoising"))
+                .on_hover_text("Applies the selected denoise method to the current image.")
+                .clicked()
+            {
+                self.apply_denoising(ui.ctx());
+            }
+
+            ui.add_space(8.0);
+            ui.heading("Inversion");
+            ui.separator();
+            ui.checkbox(&mut self.invert_values, "Invert values")
+                .on_hover_text("Swaps low and high intensities before later processing.");
+            if ui
+                .add_enabled(
+                    !is_processing && self.invert_values != self.applied_invert,
+                    Button::new("Apply Inversion"),
+                )
+                .on_hover_text("Applies or removes intensity inversion.")
+                .clicked()
+            {
+                self.apply_inversion(ui.ctx());
+            }
+
+            ui.add_space(8.0);
+            ui.heading("Distribution Equalization");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Strength");
+                ui.add(
+                    egui::Slider::new(&mut self.equalization_strength, 0.0..=1.0).show_value(true),
+                )
+                .on_hover_text(
+                    "Spreads occupied intensity values across more of the available range.",
+                );
+            });
+            if ui
+                .add_enabled(
+                    !is_processing
+                        && Some(self.equalization_strength) != self.applied_equalization
+                        && (self.equalization_strength > 0.0
+                            || self.applied_equalization.is_some()),
+                    Button::new("Apply Equalization"),
+                )
+                .on_hover_text("Applies the selected distribution equalization strength.")
+                .clicked()
+            {
+                self.apply_equalization(ui.ctx());
+            }
+
+            ui.add_space(8.0);
+            ui.heading("Gamma Adjustment");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Gamma");
+                ui.add(
+                    DragValue::new(&mut self.gamma_value)
+                        .range(0.001..=4.0)
+                        .speed(0.01),
+                )
+                .on_hover_text("Adjusts contrast nonlinearly while preserving intensity ordering.");
+            });
+
+            if ui
+                .add_enabled(!is_processing, Button::new("Apply Gamma Adjustment"))
+                .on_hover_text("Applies the selected gamma value to the current image.")
+                .clicked()
+            {
+                self.apply_gamma_adjustment(ui.ctx());
+            }
+        } else {
+            ui.label("Add an image to begin.");
+        }
     }
 
     fn show_rotation_controls(&mut self, ui: &mut Ui, is_processing: bool) {
@@ -637,149 +880,14 @@ impl VCEMApp {
             );
 
         ui.collapsing("Sensing Kernel", |ui| {
-            let old_size = self.cellular_automata_settings.kernel_size;
-            let mut new_size = old_size;
-            egui::ComboBox::from_label("Size")
-                .selected_text(format!("{old_size} x {old_size}"))
-                .show_ui(ui, |ui| {
-                    for size in (3..=15).step_by(2) {
-                        ui.selectable_value(&mut new_size, size, format!("{size} x {size}"));
-                    }
-                })
-                .response
-                .on_hover_text("Sets the local neighbourhood size sampled around each pixel.");
-            if new_size != old_size {
-                resize_cellular_kernel(&mut self.cellular_automata_settings, new_size);
-                self.cellular_kernel_preset = CellularKernelPreset::Custom;
-            }
-
-            let previous_preset = self.cellular_kernel_preset;
-            egui::ComboBox::from_label("Preset")
-                .selected_text(self.cellular_kernel_preset.label())
-                .show_ui(ui, |ui| {
-                    for preset in CellularKernelPreset::ALL {
-                        ui.selectable_value(
-                            &mut self.cellular_kernel_preset,
-                            preset,
-                            preset.label(),
-                        );
-                    }
-                })
-                .response
-                .on_hover_text("Seeds the kernel editor with common sensing shapes.");
-            if self.cellular_kernel_preset != previous_preset {
-                apply_cellular_kernel_preset(
-                    &mut self.cellular_automata_settings,
-                    self.cellular_kernel_preset,
-                    self.cellular_kernel_angle,
-                );
-            }
-            if matches!(
-                self.cellular_kernel_preset,
-                CellularKernelPreset::Line | CellularKernelPreset::Crescent
-            ) {
-                let angle_changed = ui
-                    .add(
-                        egui::Slider::new(&mut self.cellular_kernel_angle, 0.0..=180.0)
-                            .text("Angle")
-                            .suffix(" degrees"),
-                    )
-                    .on_hover_text("Rotates directional presets before applying the filter.")
-                    .changed();
-                if angle_changed {
-                    apply_cellular_kernel_preset(
-                        &mut self.cellular_automata_settings,
-                        self.cellular_kernel_preset,
-                        self.cellular_kernel_angle,
-                    );
-                }
-            }
-            ui.checkbox(
-                &mut self.cellular_automata_settings.omni_directional,
-                "Omni-directional pass",
-            )
-            .on_hover_text(
-                "Tests cardinal rotations of asymmetric kernels in each iteration and keeps the strongest response.",
+            kernel_editor::show(
+                ui,
+                &mut self.cellular_automata_settings,
+                &mut self.cellular_kernel_preset,
+                &mut self.cellular_kernel_angle,
+                &mut self.cellular_kernel_brush,
+                &mut self.cellular_kernel_drag_brush,
             );
-
-            ui.add_space(4.0);
-            let size = self.cellular_automata_settings.kernel_size;
-            let palette_width = ui.spacing().interact_size.x + 8.0;
-            let cell_size =
-                ((ui.available_width() - palette_width).max(0.0) / size as f32 - 2.0)
-                    .clamp(12.0, 24.0);
-            let primary_down = ui.input(|input| input.pointer.button_down(PointerButton::Primary));
-            if !primary_down {
-                self.cellular_kernel_drag_brush = None;
-            }
-            let pointer_pos = ui.input(|input| input.pointer.latest_pos());
-
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    for y in 0..size {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
-                            for x in 0..size {
-                                let index = y * size + x;
-                                let weight = self.cellular_automata_settings.kernel[index];
-                                let response = ui
-                                    .add_sized(
-                                        [cell_size, cell_size],
-                                        kernel_weight_button(weight).sense(Sense::click_and_drag()),
-                                    )
-                                    .on_hover_text(
-                                        "Click toggles the selected sign. Drag toggles from the starting cell and paints or erases with it. Right click cycles in reverse.",
-                                    );
-
-                                if response.clicked_by(PointerButton::Primary) {
-                                    self.cellular_automata_settings.kernel[index] =
-                                        toggle_kernel_weight(weight, self.cellular_kernel_brush);
-                                    self.cellular_kernel_preset = CellularKernelPreset::Custom;
-                                } else if response.clicked_by(PointerButton::Secondary) {
-                                    self.cellular_automata_settings.kernel[index] =
-                                        next_kernel_weight(weight, true);
-                                    self.cellular_kernel_preset = CellularKernelPreset::Custom;
-                                }
-
-                                if response.drag_started_by(PointerButton::Primary) {
-                                    let drag_brush = toggled_kernel_brush(
-                                        weight,
-                                        self.cellular_kernel_brush,
-                                    );
-                                    self.cellular_kernel_drag_brush = Some(drag_brush);
-                                    self.cellular_automata_settings.kernel[index] =
-                                        drag_brush.weight();
-                                    self.cellular_kernel_preset = CellularKernelPreset::Custom;
-                                }
-
-                                if primary_down
-                                    && pointer_pos.is_some_and(|pos| response.rect.contains(pos))
-                                    && let Some(brush) = self.cellular_kernel_drag_brush
-                                {
-                                    self.cellular_automata_settings.kernel[index] = brush.weight();
-                                    self.cellular_kernel_preset = CellularKernelPreset::Custom;
-                                }
-                            }
-                        });
-                    }
-                });
-
-                ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for brush in CellularKernelBrush::ALL {
-                        let response = ui
-                            .add_sized(
-                                [cell_size, cell_size],
-                                kernel_brush_button(brush, self.cellular_kernel_brush == brush),
-                            )
-                            .on_hover_text(brush.hover_text());
-                        if response.clicked() {
-                            self.cellular_kernel_brush = brush;
-                        }
-                    }
-                });
-            });
         });
 
         ui.collapsing("Growth Response", |ui| {
@@ -912,7 +1020,7 @@ impl VCEMApp {
             if ui
                 .add_enabled(
                     !is_processing && self.applied_cellular_automata.is_some(),
-                    Button::new("Remove Overlay"),
+                    Button::new("Remove CA Overlay"),
                 )
                 .on_hover_text("Removes the CA overlay while keeping other applied augmentations.")
                 .clicked()
@@ -920,6 +1028,975 @@ impl VCEMApp {
                 self.apply_cellular_automata(ui.ctx(), false);
             }
         });
+    }
+
+    fn show_continuous_lab_controls(&mut self, ui: &mut Ui) {
+        ui.collapsing("Kernel", |ui| {
+            ui.add(
+                egui::Slider::new(&mut self.automata_lab_settings.kernel_size, 1..=31)
+                    .step_by(2.0)
+                    .text("Size"),
+            );
+            if self.automata_lab_settings.kernel_size.is_multiple_of(2) {
+                self.automata_lab_settings.kernel_size =
+                    (self.automata_lab_settings.kernel_size + 1).min(31);
+            }
+            ui.add(
+                egui::Slider::new(
+                    &mut self.automata_lab_settings.kernel_ring_center,
+                    0.0..=1.5,
+                )
+                .text("Ring centre"),
+            );
+            ui.add(
+                egui::Slider::new(
+                    &mut self.automata_lab_settings.kernel_ring_width,
+                    0.01..=0.75,
+                )
+                .text("Ring width"),
+            );
+            let boundary_label = match self.automata_lab_settings.boundary {
+                ContinuousBoundaryPolicy::Clamp => "Clamp",
+                ContinuousBoundaryPolicy::Reflect => "Reflect",
+                ContinuousBoundaryPolicy::Wrap => "Wrap",
+                ContinuousBoundaryPolicy::Constant { .. } => "Constant zero",
+            };
+            egui::ComboBox::from_label("Boundary")
+                .selected_text(boundary_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.automata_lab_settings.boundary,
+                        ContinuousBoundaryPolicy::Clamp,
+                        "Clamp",
+                    );
+                    ui.selectable_value(
+                        &mut self.automata_lab_settings.boundary,
+                        ContinuousBoundaryPolicy::Reflect,
+                        "Reflect",
+                    );
+                    ui.selectable_value(
+                        &mut self.automata_lab_settings.boundary,
+                        ContinuousBoundaryPolicy::Wrap,
+                        "Wrap",
+                    );
+                    ui.selectable_value(
+                        &mut self.automata_lab_settings.boundary,
+                        ContinuousBoundaryPolicy::Constant { value: 0.0 },
+                        "Constant zero",
+                    );
+                });
+        });
+
+        ui.collapsing("Growth", |ui| {
+            ui.add(
+                egui::Slider::new(&mut self.automata_lab_settings.growth_center, -0.5..=1.5)
+                    .text("Centre"),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.automata_lab_settings.growth_width, 0.005..=0.5)
+                    .text("Width"),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.automata_lab_settings.time_step, 0.001..=0.5)
+                    .logarithmic(true)
+                    .text("Time step"),
+            );
+        });
+        self.show_continuous_visualizations(ui);
+    }
+
+    /// Keeps the active rule's dense table at the length its current
+    /// state/kernel/reducer configuration requires, so the table editor
+    /// never renders against a stale length.
+    fn sync_discrete_table_lengths(&mut self) {
+        let Ok(expected) = self.automata_lab_discrete_settings.expected_table_len() else {
+            return;
+        };
+        if expected > MAX_AUTHORING_TABLE_LEN {
+            return;
+        }
+        let settings = &mut self.automata_lab_discrete_settings;
+        let max_state = settings.state_count.saturating_sub(1);
+        for table in [
+            &mut settings.direct_table,
+            &mut settings.aggregate_table,
+            &mut settings.ordered_table,
+            &mut settings.presence_fallback,
+        ] {
+            for value in table {
+                *value = (*value).min(max_state);
+            }
+        }
+        settings
+            .presence_transitions
+            .retain(|t| t.trigger_state <= max_state);
+        for t in &mut settings.presence_transitions {
+            t.output_state = t.output_state.min(max_state);
+        }
+        if let BoundaryPolicy::Constant(value) = &mut settings.boundary {
+            *value = (*value).min(max_state);
+        }
+        let table = match settings.rule_kind {
+            DiscreteRuleKind::Direct => &mut settings.direct_table,
+            DiscreteRuleKind::Aggregate => &mut settings.aggregate_table,
+            DiscreteRuleKind::OrderedNeighborhood => &mut settings.ordered_table,
+            DiscreteRuleKind::PresenceTriggered => &mut settings.presence_fallback,
+        };
+        if table.len() != expected {
+            *table = resized_table(std::mem::take(table), expected, 0);
+        }
+    }
+
+    fn show_discrete_lab_controls(&mut self, ui: &mut Ui) {
+        self.sync_discrete_table_lengths();
+        egui::CollapsingHeader::new("State & Kernel")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.automata_lab_discrete_settings.state_count, 2..=64)
+                        .text("State count"),
+                );
+                egui::CollapsingHeader::new("Sensing Kernel")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        self.show_discrete_kernel_grid(ui);
+                        self.show_discrete_generators(ui);
+                        self.show_candidate_controls(ui);
+                    });
+                self.sync_discrete_table_lengths();
+                let boundary_label = match self.automata_lab_discrete_settings.boundary {
+                    BoundaryPolicy::Clamp => "Clamp",
+                    BoundaryPolicy::Reflect => "Reflect",
+                    BoundaryPolicy::Wrap => "Wrap",
+                    BoundaryPolicy::Constant(_) => "Constant",
+                };
+                egui::ComboBox::from_label("Boundary")
+                    .selected_text(boundary_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.automata_lab_discrete_settings.boundary,
+                            BoundaryPolicy::Clamp,
+                            "Clamp",
+                        );
+                        ui.selectable_value(
+                            &mut self.automata_lab_discrete_settings.boundary,
+                            BoundaryPolicy::Reflect,
+                            "Reflect",
+                        );
+                        ui.selectable_value(
+                            &mut self.automata_lab_discrete_settings.boundary,
+                            BoundaryPolicy::Wrap,
+                            "Wrap",
+                        );
+                        ui.selectable_value(
+                            &mut self.automata_lab_discrete_settings.boundary,
+                            BoundaryPolicy::Constant(0),
+                            "Constant",
+                        );
+                    });
+                if let BoundaryPolicy::Constant(value) =
+                    &mut self.automata_lab_discrete_settings.boundary
+                {
+                    let max_state = self
+                        .automata_lab_discrete_settings
+                        .state_count
+                        .saturating_sub(1);
+                    ui.add(
+                        DragValue::new(value)
+                            .range(0..=max_state)
+                            .prefix("Constant state: "),
+                    );
+                }
+            });
+
+        egui::CollapsingHeader::new("Rule")
+            .default_open(true)
+            .show(ui, |ui| {
+                self.show_discrete_rule_controls(ui);
+            });
+        self.show_discrete_visualizations(ui);
+    }
+
+    fn show_discrete_rule_controls(&mut self, ui: &mut Ui) {
+        let old_kind = self.automata_lab_discrete_settings.rule_kind;
+        egui::ComboBox::from_label("Rule kind")
+            .selected_text(discrete_rule_kind_label(old_kind))
+            .show_ui(ui, |ui| {
+                for kind in [
+                    DiscreteRuleKind::Direct,
+                    DiscreteRuleKind::Aggregate,
+                    DiscreteRuleKind::OrderedNeighborhood,
+                    DiscreteRuleKind::PresenceTriggered,
+                ] {
+                    ui.selectable_value(
+                        &mut self.automata_lab_discrete_settings.rule_kind,
+                        kind,
+                        discrete_rule_kind_label(kind),
+                    );
+                }
+            });
+        if self.automata_lab_discrete_settings.rule_kind != old_kind {
+            self.sync_discrete_table_lengths();
+        }
+
+        match self.automata_lab_discrete_settings.rule_kind {
+            DiscreteRuleKind::Direct => {
+                self.show_discrete_dense_table(ui, DiscreteTableTarget::Direct);
+            }
+            DiscreteRuleKind::Aggregate => {
+                let old_reducer = self.automata_lab_discrete_settings.aggregate_reducer;
+                let reducer_label = match old_reducer {
+                    AggregateReducer::RoundedMean => "Rounded mean",
+                    AggregateReducer::Sum => "Sum",
+                };
+                egui::ComboBox::from_label("Reducer")
+                    .selected_text(reducer_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.automata_lab_discrete_settings.aggregate_reducer,
+                            AggregateReducer::RoundedMean,
+                            "Rounded mean",
+                        );
+                        ui.selectable_value(
+                            &mut self.automata_lab_discrete_settings.aggregate_reducer,
+                            AggregateReducer::Sum,
+                            "Sum",
+                        );
+                    });
+                if self.automata_lab_discrete_settings.aggregate_reducer != old_reducer {
+                    self.sync_discrete_table_lengths();
+                }
+                self.show_discrete_dense_table(ui, DiscreteTableTarget::Aggregate);
+            }
+            DiscreteRuleKind::OrderedNeighborhood => {
+                self.show_discrete_dense_table(ui, DiscreteTableTarget::Ordered);
+            }
+            DiscreteRuleKind::PresenceTriggered => {
+                self.show_discrete_presence_controls(ui);
+            }
+        }
+    }
+
+    fn show_discrete_presence_controls(&mut self, ui: &mut Ui) {
+        let state_count = self.automata_lab_discrete_settings.state_count;
+        let max_state = state_count.saturating_sub(1);
+
+        let reduction_label = match self.automata_lab_discrete_settings.presence_reduction {
+            PresenceReduction::LowestTrigger => "Lowest trigger wins",
+            PresenceReduction::HighestTrigger => "Highest trigger wins",
+        };
+        egui::ComboBox::from_label("Reduction")
+            .selected_text(reduction_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.automata_lab_discrete_settings.presence_reduction,
+                    PresenceReduction::LowestTrigger,
+                    "Lowest trigger wins",
+                );
+                ui.selectable_value(
+                    &mut self.automata_lab_discrete_settings.presence_reduction,
+                    PresenceReduction::HighestTrigger,
+                    "Highest trigger wins",
+                );
+            });
+
+        ui.separator();
+        ui.label("Transitions");
+        let mut remove = None;
+        for (index, transition) in self
+            .automata_lab_discrete_settings
+            .presence_transitions
+            .iter_mut()
+            .enumerate()
+        {
+            ui.horizontal(|ui| {
+                ui.label("If present:");
+                ui.add(DragValue::new(&mut transition.trigger_state).range(0..=max_state));
+                ui.label("-> output:");
+                ui.add(DragValue::new(&mut transition.output_state).range(0..=max_state));
+                if ui.button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            self.automata_lab_discrete_settings
+                .presence_transitions
+                .remove(index);
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Add:");
+            ui.add(
+                DragValue::new(&mut self.automata_lab_presence_draft_trigger).range(0..=max_state),
+            );
+            ui.label("->");
+            ui.add(
+                DragValue::new(&mut self.automata_lab_presence_draft_output).range(0..=max_state),
+            );
+            if ui.button("Add transition").clicked() {
+                self.automata_lab_discrete_settings
+                    .presence_transitions
+                    .push(PresenceTransition {
+                        trigger_state: self.automata_lab_presence_draft_trigger,
+                        output_state: self.automata_lab_presence_draft_output,
+                    });
+            }
+        });
+
+        ui.separator();
+        ui.label("Fallback (no trigger present)");
+        self.show_discrete_dense_table(ui, DiscreteTableTarget::PresenceFallback);
+    }
+
+    fn show_discrete_dense_table(&mut self, ui: &mut Ui, target: DiscreteTableTarget) {
+        self.sync_discrete_table_lengths();
+        let state_count = self.automata_lab_discrete_settings.state_count;
+        let max_state = state_count.saturating_sub(1);
+        let table = match target {
+            DiscreteTableTarget::Direct => &mut self.automata_lab_discrete_settings.direct_table,
+            DiscreteTableTarget::Aggregate => {
+                &mut self.automata_lab_discrete_settings.aggregate_table
+            }
+            DiscreteTableTarget::Ordered => &mut self.automata_lab_discrete_settings.ordered_table,
+            DiscreteTableTarget::PresenceFallback => {
+                &mut self.automata_lab_discrete_settings.presence_fallback
+            }
+        };
+        let len = table.len();
+        ui.label(format!("{len} entries"));
+        if len > MAX_DISCRETE_UI_TABLE_LEN {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Large table: use bulk fills or the random rule generator. The graph samples at most 512 entries.",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Identity").clicked() {
+                    for (index, value) in table.iter_mut().enumerate() {
+                        *value = (index as u32) % state_count;
+                    }
+                }
+                if ui.button("All -> 0").clicked() {
+                    table.fill(0);
+                }
+            });
+            return;
+        }
+        let columns = (ui.available_width() / 85.0).floor().max(1.0) as usize;
+        ScrollArea::vertical()
+            .id_salt(("rule table scroll", target as u8))
+            .max_height(240.0)
+            .show(ui, |ui| {
+                egui::Grid::new(("discrete_table_grid", target as u8)).show(ui, |ui| {
+                    for (index, value) in table.iter_mut().enumerate() {
+                        ui.add(
+                            DragValue::new(value)
+                                .range(0..=max_state)
+                                .prefix(format!("{index} → ")),
+                        );
+                        if (index + 1) % columns == 0 {
+                            ui.end_row();
+                        }
+                    }
+                    ui.end_row();
+                });
+            });
+    }
+
+    fn show_automata_lab_right_panel(&mut self, ui: &mut Ui) {
+        Panel::right("right_panel")
+            .resizable(true)
+            .default_size(280.0)
+            .min_size(210.0)
+            .show(ui, |ui| {
+                ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Automata Lab");
+                    egui::CollapsingHeader::new("Image preparation").default_open(true).show(ui, |ui| {
+                        self.show_image_controls(ui);
+                    });
+                    self.show_lab_configuration_controls(ui);
+                    let image_busy = self.processing_job.is_some() || self.masks.is_busy();
+                    ui.add_enabled_ui(!image_busy, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.automata_lab_model_family,
+                            LabModelFamily::Discrete,
+                            "Discrete map",
+                        );
+                        ui.selectable_value(
+                            &mut self.automata_lab_model_family,
+                            LabModelFamily::Continuous,
+                            "Continuous Lenia",
+                        );
+                    });
+                    ui.separator();
+
+                    if let Some(displayed) = self.displayed_image.as_ref() {
+                        ui.label(format!(
+                            "Prepared plane: {} x {}",
+                            displayed.size.x as usize, displayed.size.y as usize
+                        ));
+                        ui.label(format!(
+                            "Calibration: {}..{}",
+                            displayed.calibration.minimum, displayed.calibration.maximum_exclusive
+                        ));
+                    } else {
+                        ui.label("Load an image to initialize generation zero.");
+                    }
+
+                    ui.add_space(6.0);
+                    match self.automata_lab_model_family {
+                        LabModelFamily::Discrete => self.show_discrete_lab_controls(ui),
+                        LabModelFamily::Continuous => self.show_continuous_lab_controls(ui),
+                    }
+                    ui.collapsing("Playback", |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.automata_lab_cycles_per_step, 1..=32)
+                                .text("Cycles / step"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.automata_lab_steps_per_second, 1.0..=60.0)
+                                .text("Steps / second"),
+                        );
+                        let checkpoint_response = ui.add(
+                            egui::Slider::new(
+                                &mut self.automata_lab_capture_policy.checkpoint_interval,
+                                1..=100,
+                            )
+                            .text("Checkpoint interval"),
+                        );
+                        if checkpoint_response.changed() {
+                            self.cancel_automata_lab_job();
+                            if let Some(session) = self.automata_lab_session.as_mut()
+                                && let Err(error) =
+                                    session.set_capture_policy(self.automata_lab_capture_policy)
+                            {
+                                self.automata_lab_error = Some(error.to_string());
+                                self.automata_lab_capture_policy = session.capture_policy();
+                            }
+                        }
+                    });
+
+                    self.show_lab_run_controls(ui);
+                    let has_session = self.automata_lab_session.is_some();
+                    let is_stepping = self.automata_lab_job.is_some();
+
+                    let checkpoint_generations = self
+                        .automata_lab_session
+                        .as_ref()
+                        .map(|session| {
+                            session
+                                .checkpoints()
+                                .iter()
+                                .map(|checkpoint| checkpoint.generation)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    {
+                        ui.separator();
+                        ui.collapsing("Timeline", |ui| {
+                            if checkpoint_generations.len() < 2 { ui.label("Run the simulation to create checkpoints."); return; }
+                            let max_index = checkpoint_generations.len() - 1;
+                            let mut index = max_index;
+                            let response = ui.add_enabled(
+                                !is_stepping,
+                                egui::Slider::new(&mut index, 0..=max_index).custom_formatter(
+                                    |value, _| {
+                                        format!(
+                                            "Generation {}",
+                                            checkpoint_generations[value as usize]
+                                        )
+                                    },
+                                ),
+                            );
+                            ui.label(
+                                "Drag to scrub. Scrubbing to an earlier generation discards later history.",
+                            );
+                            if response.changed() && index != max_index {
+                                self.restore_automata_lab_checkpoint(ui.ctx(), index);
+                            }
+                        });
+                    }
+
+                    {
+                        ui.separator();
+                        ui.collapsing("State bookmarks", |ui| {
+                            ui.text_edit_singleline(&mut self.automata_lab_bookmark_name);
+                            if ui
+                                .add_enabled(has_session && !is_stepping, Button::new("Save Current"))
+                                .clicked()
+                            {
+                                self.save_automata_lab_bookmark();
+                            }
+                            let bookmarks = self
+                                .automata_lab_session
+                                .as_ref()
+                                .map(|session| {
+                                    session
+                                        .bookmarks()
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, bookmark)| {
+                                            (index, bookmark.name.clone(), bookmark.generation)
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            let mut restore = None;
+                            for (index, name, generation) in bookmarks {
+                                if ui
+                                    .add_enabled(
+                                        !is_stepping,
+                                        Button::new(format!("{name} — generation {generation}")),
+                                    )
+                                    .clicked()
+                                {
+                                    restore = Some(index);
+                                }
+                            }
+                            if let Some(index) = restore {
+                                self.restore_automata_lab_bookmark(ui.ctx(), index);
+                            }
+                        });
+                    }
+                    });
+                    let busy = image_busy || self.automata_lab_job.is_some() || self.automata_lab_playing;
+                    self.show_mask_controls(ui, busy);
+                });
+            });
+    }
+
+    fn initialize_automata_lab(&mut self, ctx: &egui::Context) {
+        if self.processing_job.is_some() || self.masks.is_busy() {
+            return;
+        }
+        self.automata_lab_playing = false;
+        self.cancel_automata_lab_job();
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        self.automata_lab_step_progress = None;
+
+        let Some(displayed) = self.displayed_image.as_ref() else {
+            self.automata_lab_error = Some(
+                "Wait for the selected image to finish loading before initializing the Lab."
+                    .to_owned(),
+            );
+            return;
+        };
+        if let Err(error) = self.lab_draft_model().validate() {
+            self.automata_lab_error = Some(error);
+            return;
+        }
+        let size = [displayed.size.x as usize, displayed.size.y as usize];
+        let program_document = match self.automata_lab_model_family {
+            LabModelFamily::Continuous => self
+                .automata_lab_settings
+                .program_document(displayed.calibration),
+            LabModelFamily::Discrete => self
+                .automata_lab_discrete_settings
+                .program_document(displayed.calibration),
+        };
+        let program_document = match program_document {
+            Ok(program) => program,
+            Err(error) => {
+                self.automata_lab_error = Some(error.to_string());
+                return;
+            }
+        };
+        match AutomataLabSession::new(
+            &displayed.prepared_values,
+            displayed.calibration,
+            size,
+            program_document,
+            AutomataCompileLimits::default(),
+            self.automata_lab_execution_policy,
+            self.automata_lab_capture_policy,
+        ) {
+            Ok(session) => {
+                self.lab_applied_model = Some(self.lab_draft_model());
+                self.automata_lab_session = Some(session);
+                self.masks.show_current_ca();
+                self.automata_lab_notice = Some(
+                    "Generation zero was initialized from the prepared image plane.".to_owned(),
+                );
+                self.refresh_automata_lab_texture(ctx);
+            }
+            Err(error) => {
+                self.automata_lab_session = None;
+                self.automata_lab_texture = None;
+                self.automata_lab_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn reset_automata_lab(&mut self, ctx: &egui::Context) {
+        self.automata_lab_playing = false;
+        self.cancel_automata_lab_job();
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        self.automata_lab_step_progress = None;
+        if let Some(session) = self.automata_lab_session.as_mut() {
+            session.reset();
+            self.automata_lab_notice = Some("Restored generation zero.".to_owned());
+            self.refresh_automata_lab_texture(ctx);
+        }
+    }
+
+    fn step_automata_lab(&mut self, ctx: &egui::Context, cycles: u32) {
+        if self.automata_lab_job.is_some() {
+            return;
+        }
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        self.automata_lab_step_progress = None;
+        self.masks.show_current_ca();
+        if cycles == 0 {
+            self.automata_lab_error =
+                Some("Automata Lab steps require at least one cycle.".to_owned());
+            return;
+        }
+        let Some(mut session) = self.automata_lab_session.clone() else {
+            self.automata_lab_error = Some("Initialize the Automata Lab first.".to_owned());
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let repaint_ctx = ctx.clone();
+        thread::spawn(move || {
+            // Catch a panic instead of letting it unwind the thread silently:
+            // an uncaught panic here would just drop `sender`, and the
+            // receiving side can only observe that as a disconnected channel
+            // with no information about what went wrong.
+            let panic_sender = sender.clone();
+            let panic_ctx = repaint_ctx.clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                // Advance one generation at a time so every intermediate state
+                // is reported: the overlay animates live instead of jumping
+                // straight to the result of a multi-cycle step, and the UI can
+                // show real "generation X of Y" progress rather than an
+                // indeterminate spin.
+                let mut completed = 0_u32;
+                let mut total_outcome = LabStepOutcome::default();
+                while completed < cycles {
+                    match session.step_with_cancellation(1, &worker_cancellation) {
+                        Ok(outcome) => {
+                            completed += 1;
+                            total_outcome.checkpoints_created += outcome.checkpoints_created;
+                            total_outcome.checkpoints_skipped_for_budget +=
+                                outcome.checkpoints_skipped_for_budget;
+                            let done = completed >= cycles;
+                            let update = if done {
+                                AutomataLabStepUpdate::Done {
+                                    session: Box::new(session.clone()),
+                                    outcome: total_outcome,
+                                }
+                            } else {
+                                AutomataLabStepUpdate::Progress {
+                                    state: session.current_state_snapshot(),
+                                    generation: session.generation(),
+                                    diagnostics: session.last_diagnostics(),
+                                    cycles_completed: completed,
+                                    cycles_total: cycles,
+                                }
+                            };
+                            if sender.send(update).is_err() {
+                                return;
+                            }
+                            repaint_ctx.request_repaint();
+                            if done {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(AutomataLabStepUpdate::Failed(error.to_string()));
+                            repaint_ctx.request_repaint();
+                            return;
+                        }
+                    }
+                }
+            }));
+            if let Err(panic_payload) = outcome {
+                let reason = panic_payload_message(&panic_payload);
+                let _ = panic_sender.send(AutomataLabStepUpdate::Failed(format!(
+                    "The Automata Lab worker crashed: {reason}. This is a bug; the current step's progress was discarded, but generation zero and earlier checkpoints/bookmarks are unaffected."
+                )));
+                panic_ctx.request_repaint();
+            }
+        });
+        self.automata_lab_job = Some(AutomataLabJob {
+            receiver,
+            cancellation,
+            discard_result: false,
+        });
+        ctx.request_repaint();
+    }
+
+    fn poll_automata_lab_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.automata_lab_job.as_ref() else {
+            return;
+        };
+        let discard_result = job.discard_result;
+        // Drain every pending update so the UI never falls behind a fast
+        // worker; only the most recent update (which may be the terminal
+        // one) is applied.
+        let mut latest_update = None;
+        loop {
+            match job.receiver.try_recv() {
+                Ok(update) => {
+                    let terminal = matches!(
+                        update,
+                        AutomataLabStepUpdate::Done { .. } | AutomataLabStepUpdate::Failed(_)
+                    );
+                    latest_update = Some(update);
+                    // A completed worker closes its channel after Done. Do not
+                    // replace that successful result with a disconnect error.
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The worker thread should always send a Done/Failed
+                    // message before exiting, and catches its own panics to
+                    // report them as Failed (see step_automata_lab). Reaching
+                    // this without ever seeing a terminal message would mean
+                    // the process itself is in serious trouble (e.g. a stack
+                    // overflow, which aborts and cannot be caught) rather than
+                    // an ordinary bug in the step computation.
+                    latest_update = Some(AutomataLabStepUpdate::Failed(
+                        "The Automata Lab worker thread exited without reporting a result. \
+                         This should not happen and suggests a serious problem (such as a stack \
+                         overflow) rather than a normal computation error; check the terminal \
+                         you launched VCEM from for a crash message, and consider filing a bug \
+                         with the steps that triggered it."
+                            .to_owned(),
+                    ));
+                    break;
+                }
+            }
+        }
+        let Some(update) = latest_update else {
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return;
+        };
+        let is_terminal = matches!(
+            update,
+            AutomataLabStepUpdate::Done { .. } | AutomataLabStepUpdate::Failed(_)
+        );
+        if is_terminal {
+            self.automata_lab_job = None;
+            self.automata_lab_step_progress = None;
+        }
+        if discard_result {
+            if !is_terminal {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+            return;
+        }
+        match update {
+            AutomataLabStepUpdate::Progress {
+                state,
+                generation,
+                diagnostics,
+                cycles_completed,
+                cycles_total,
+            } => {
+                if let Some(session) = self.automata_lab_session.as_mut() {
+                    session.apply_live_progress(state, generation, diagnostics);
+                }
+                self.automata_lab_step_progress = Some((cycles_completed, cycles_total));
+                self.refresh_automata_lab_texture(ctx);
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+            AutomataLabStepUpdate::Done { session, outcome } => {
+                self.automata_lab_session = Some(*session);
+                if outcome.checkpoints_skipped_for_budget > 0 {
+                    self.automata_lab_notice = Some(format!(
+                        "The step completed, but {} timeline checkpoint(s) exceeded the history budget.",
+                        outcome.checkpoints_skipped_for_budget
+                    ));
+                }
+                self.refresh_automata_lab_texture(ctx);
+            }
+            AutomataLabStepUpdate::Failed(error) => {
+                self.automata_lab_playing = false;
+                self.automata_lab_error = Some(error);
+            }
+        }
+    }
+
+    fn restore_automata_lab_checkpoint(&mut self, ctx: &egui::Context, index: usize) {
+        self.automata_lab_playing = false;
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        let result = self
+            .automata_lab_session
+            .as_mut()
+            .ok_or_else(|| "Initialize the Automata Lab first.".to_owned())
+            .and_then(|session| {
+                session
+                    .restore_checkpoint(index)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                self.automata_lab_notice = Some("Restored timeline checkpoint.".to_owned());
+                self.refresh_automata_lab_texture(ctx);
+            }
+            Err(error) => self.automata_lab_error = Some(error),
+        }
+    }
+
+    fn save_automata_lab_bookmark(&mut self) {
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        let name = self.automata_lab_bookmark_name.trim().to_owned();
+        let result = self
+            .automata_lab_session
+            .as_mut()
+            .ok_or_else(|| "Initialize the Automata Lab first.".to_owned())
+            .and_then(|session| {
+                session
+                    .save_bookmark(&name)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                let bookmark_number = self
+                    .automata_lab_session
+                    .as_ref()
+                    .map_or(1, |session| session.bookmarks().len() + 1);
+                self.automata_lab_bookmark_name = format!("Bookmark {bookmark_number}");
+                self.automata_lab_notice = Some(format!("Saved state bookmark {name:?}."));
+            }
+            Err(error) => self.automata_lab_error = Some(error),
+        }
+    }
+
+    fn restore_automata_lab_bookmark(&mut self, ctx: &egui::Context, index: usize) {
+        self.automata_lab_playing = false;
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        let result = self
+            .automata_lab_session
+            .as_mut()
+            .ok_or_else(|| "Initialize the Automata Lab first.".to_owned())
+            .and_then(|session| {
+                session
+                    .restore_bookmark(index)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(()) => {
+                self.automata_lab_notice = Some("Restored state bookmark.".to_owned());
+                self.refresh_automata_lab_texture(ctx);
+            }
+            Err(error) => self.automata_lab_error = Some(error),
+        }
+    }
+
+    fn refresh_automata_lab_texture(&mut self, ctx: &egui::Context) {
+        let Some(session) = self.automata_lab_session.as_ref() else {
+            self.automata_lab_texture = None;
+            return;
+        };
+        let overlay = if let Some(state) = session.continuous_state() {
+            let specification = OverlayProjectionSpec {
+                version: OUTPUT_PROJECTION_VERSION,
+                field: NumericProjectionSpec {
+                    version: OUTPUT_PROJECTION_VERSION,
+                    source: ProjectionSource::NormalizedFinalState,
+                    transfer: ProjectionTransfer::Power { exponent: 0.5 },
+                },
+                color: crate::types::CA_MASK_RGB,
+                maximum_alpha: 224,
+            };
+            project_continuous_state_overlay(
+                state,
+                session.size(),
+                ContinuousDomain::UNIT,
+                &specification,
+                ProjectionLimits::default(),
+            )
+        } else if let Some(state) = session.discrete_state() {
+            let Some(state_count) = discrete_program_state_count(session.program_document()) else {
+                self.automata_lab_texture = None;
+                self.automata_lab_error =
+                    Some("Discrete Lab session is missing its state count.".to_owned());
+                return;
+            };
+            let specification = OverlayProjectionSpec {
+                version: OUTPUT_PROJECTION_VERSION,
+                field: NumericProjectionSpec {
+                    version: OUTPUT_PROJECTION_VERSION,
+                    source: ProjectionSource::NormalizedFinalState,
+                    transfer: ProjectionTransfer::Identity,
+                },
+                color: crate::types::CA_MASK_RGB,
+                maximum_alpha: 224,
+            };
+            project_discrete_state_overlay(
+                state,
+                session.size(),
+                state_count,
+                &specification,
+                ProjectionLimits::default(),
+            )
+        } else {
+            self.automata_lab_texture = None;
+            return;
+        };
+        match overlay {
+            Ok(overlay) => {
+                let color_image =
+                    egui::ColorImage::from_rgba_unmultiplied(overlay.size, &overlay.rgba);
+                self.automata_lab_texture = Some(ctx.load_texture(
+                    "Automata Lab state overlay",
+                    color_image,
+                    TextureOptions::LINEAR,
+                ));
+            }
+            Err(error) => {
+                self.automata_lab_playing = false;
+                self.automata_lab_texture = None;
+                self.automata_lab_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn advance_automata_lab(&mut self, ctx: &egui::Context) {
+        if !self.automata_lab_playing || self.view_mode != ViewMode::AutomataLab {
+            return;
+        }
+        let interval = Duration::from_secs_f32(1.0 / self.automata_lab_steps_per_second.max(1.0));
+        let elapsed = self.automata_lab_last_step.elapsed();
+        if elapsed >= interval {
+            self.automata_lab_last_step = Instant::now();
+            self.step_automata_lab(ctx, self.automata_lab_cycles_per_step);
+        }
+        if self.automata_lab_playing {
+            ctx.request_repaint_after(interval.saturating_sub(elapsed));
+        }
+    }
+
+    fn invalidate_automata_lab(&mut self) {
+        self.automata_lab_playing = false;
+        self.cancel_automata_lab_job();
+        self.automata_lab_session = None;
+        self.lab_applied_model = None;
+        self.lab_replay_generations = None;
+        self.automata_lab_texture = None;
+        self.automata_lab_error = None;
+        self.automata_lab_notice = None;
+        self.automata_lab_step_progress = None;
+    }
+
+    fn cancel_automata_lab_job(&mut self) {
+        if let Some(job) = self.automata_lab_job.as_mut() {
+            job.cancellation.store(true, Ordering::Relaxed);
+            job.discard_result = true;
+        }
     }
 
     fn show_bottom_panel(&mut self, ui: &mut Ui) {
@@ -940,6 +2017,19 @@ impl VCEMApp {
 
                     ui.separator();
                     ui.label(format!("Zoom {:.0}%", self.viewer_zoom * 100.0));
+                    if self.view_mode == ViewMode::AutomataLab {
+                        if let Some(session) = self.automata_lab_session.as_ref() {
+                            ui.separator();
+                            ui.label(format!("Generation {}", session.generation()));
+                        }
+                        if self.automata_lab_job.is_some() {
+                            ui.separator();
+                            ui.label("Computing");
+                        } else if self.automata_lab_playing {
+                            ui.separator();
+                            ui.label("Playing");
+                        }
+                    }
                 });
             });
     }
@@ -948,6 +2038,8 @@ impl VCEMApp {
         CentralPanel::default_margins().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Image Viewer");
+                ui.colored_label(Color32::from_rgb(30, 210, 190), "CA mask");
+                ui.colored_label(Color32::from_rgb(255, 184, 54), "Pixel selection");
                 if self.selected_image.is_some() {
                     ui.separator();
                     if ui.button("Fit").clicked() {
@@ -970,6 +2062,7 @@ impl VCEMApp {
 
             self.ensure_selected_image_loaded(ui.ctx());
             self.ensure_histogram_highlight_texture(ui.ctx());
+            self.masks.refresh(ui.ctx());
 
             if let Some(error) = &self.viewer_error {
                 painter.text(
@@ -987,10 +2080,16 @@ impl VCEMApp {
                     (
                         displayed.texture.id(),
                         displayed.size,
-                        displayed
-                            .cellular_automata_texture
-                            .as_ref()
-                            .map(|texture| texture.id()),
+                        if self.view_mode == ViewMode::AutomataLab {
+                            self.automata_lab_texture
+                                .as_ref()
+                                .map(|texture| texture.id())
+                        } else {
+                            displayed
+                                .cellular_automata_texture
+                                .as_ref()
+                                .map(|texture| texture.id())
+                        },
                         displayed
                             .highlight_texture
                             .as_ref()
@@ -1045,7 +2144,25 @@ impl VCEMApp {
             let image_rect =
                 Rect::from_center_size(canvas_rect.center() + self.viewer_pan, draw_size);
 
-            if response.drag_started_by(PointerButton::Primary) {
+            let selecting_candidate = self.view_mode == ViewMode::AutomataLab
+                && self.automata_lab_model_family == LabModelFamily::Discrete
+                && self.candidates.selecting()
+                && self.processing_job.is_none();
+            if selecting_candidate {
+                self.candidates.region_pointer(
+                    &response,
+                    image_rect,
+                    [image_size.x as usize, image_size.y as usize],
+                );
+                self.image_selection_start = None;
+            }
+            let marking_region =
+                selecting_candidate || (self.masks.marking() && self.processing_job.is_none());
+            if marking_region && !selecting_candidate {
+                self.masks.region_pointer(&response, image_rect);
+                self.image_selection_start = None;
+            }
+            if !marking_region && response.drag_started_by(PointerButton::Primary) {
                 self.image_selection_start = response
                     .interact_pointer_pos()
                     .filter(|pointer| image_rect.contains(*pointer));
@@ -1074,15 +2191,16 @@ impl VCEMApp {
                 self.image_selection_start = None;
             }
 
-            let clicked_image_bin = if response.clicked_by(PointerButton::Primary) {
-                response.interact_pointer_pos().and_then(|pointer| {
-                    self.displayed_image
-                        .as_ref()
-                        .and_then(|displayed| displayed.bin_at_pointer(image_rect, pointer))
-                })
-            } else {
-                None
-            };
+            let clicked_image_bin =
+                if !marking_region && response.clicked_by(PointerButton::Primary) {
+                    response.interact_pointer_pos().and_then(|pointer| {
+                        self.displayed_image
+                            .as_ref()
+                            .and_then(|displayed| displayed.bin_at_pointer(image_rect, pointer))
+                    })
+                } else {
+                    None
+                };
             if let Some(bin) = clicked_image_bin {
                 self.select_single_histogram_bin(bin);
                 ui.ctx().request_repaint();
@@ -1102,7 +2220,9 @@ impl VCEMApp {
                 Color32::WHITE,
             );
 
-            if let Some(cellular_texture_id) = cellular_texture_id {
+            if let Some(cellular_texture_id) =
+                cellular_texture_id.filter(|_| !self.masks.suppress_other_overlays())
+            {
                 painter.image(
                     cellular_texture_id,
                     image_rect,
@@ -1111,7 +2231,28 @@ impl VCEMApp {
                 );
             }
 
-            if let Some(highlight_texture_id) = highlight_texture_id {
+            if let Some(mask_texture) = self.masks.texture_id() {
+                painter.image(
+                    mask_texture,
+                    image_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            self.masks.paint_regions(&painter, image_rect);
+            if self.view_mode == ViewMode::AutomataLab
+                && self.automata_lab_model_family == LabModelFamily::Discrete
+            {
+                self.candidates.paint(
+                    &painter,
+                    image_rect,
+                    [image_size.x as usize, image_size.y as usize],
+                );
+            }
+
+            if let Some(highlight_texture_id) =
+                highlight_texture_id.filter(|_| !self.masks.suppress_other_overlays())
+            {
                 painter.image(
                     highlight_texture_id,
                     image_rect,
@@ -1486,6 +2627,7 @@ impl VCEMApp {
 
         if let Some(index) = first_added {
             self.selected_image = Some(index);
+            self.invalidate_automata_lab();
             self.displayed_image = None;
             self.viewer_error = None;
             self.viewer_needs_fit = true;
@@ -1493,6 +2635,7 @@ impl VCEMApp {
             self.histogram_error = None;
             self.reset_histogram_view = true;
             self.clear_histogram_highlight();
+            self.downsampling = self.applied_downsampling;
             self.applied_denoise = None;
             self.invert_values = false;
             self.applied_invert = false;
@@ -1509,49 +2652,29 @@ impl VCEMApp {
         }
     }
 
-    fn create_intensity_histogram(&mut self) {
+    fn create_intensity_histogram(&mut self, ctx: &egui::Context) {
+        self.histogram_bin_count.commit();
         self.histogram = None;
         self.histogram_error = None;
+        self.reset_histogram_view = true;
+        self.clear_histogram_highlight();
 
-        let Some(path) = self
-            .selected_image
-            .and_then(|index| self.images.get(index))
-            .map(|image| image.path.clone())
-        else {
+        let Some((image_index, path, name)) = self.selected_image.and_then(|index| {
+            self.images
+                .get(index)
+                .map(|image| (index, image.path.clone(), image.name.clone()))
+        }) else {
             self.histogram_error = Some("Select an image before creating a histogram.".to_owned());
             return;
         };
 
-        if self.applied_rotation != ImageRotation::None
-            || self.applied_denoise.is_some()
-            || self.applied_invert
-            || self.applied_equalization.is_some()
-            || self.applied_gamma.is_some()
-        {
-            let mut configuration = self.applied_experiment_configuration();
-            configuration.cellular_automata = None;
-            match processed_image_from_path(&path, &configuration) {
-                Ok(processed) => {
-                    self.histogram = Some(processed.histogram);
-                    self.reset_histogram_view = true;
-                }
-                Err(error) => {
-                    self.histogram_error = Some(error);
-                    self.reset_histogram_view = true;
-                }
-            }
-        } else {
-            match intensity_histogram_from_path(&path, self.histogram_bin_count) {
-                Ok(histogram) => {
-                    self.histogram = Some(histogram);
-                    self.reset_histogram_view = true;
-                }
-                Err(error) => {
-                    self.histogram_error = Some(error);
-                    self.reset_histogram_view = true;
-                }
-            }
-        }
+        self.start_processing_job(
+            ctx,
+            image_index,
+            path,
+            name,
+            ProcessingKind::Preview(self.applied_experiment_configuration()),
+        );
     }
 
     fn current_denoise_settings(&self) -> Option<DenoiseSettings> {
@@ -1564,7 +2687,8 @@ impl VCEMApp {
     fn applied_experiment_configuration(&self) -> ExperimentConfiguration {
         ExperimentConfiguration {
             schema_version: 1,
-            histogram_bin_count: self.histogram_bin_count,
+            downsampling: self.applied_downsampling,
+            histogram_bin_count: self.histogram_bin_count.applied(),
             rotation: self.applied_rotation,
             denoise: self.applied_denoise,
             invert: self.applied_invert,
@@ -1825,8 +2949,10 @@ impl VCEMApp {
     }
 
     fn sync_controls_from_configuration(&mut self, configuration: &ExperimentConfiguration) {
-        self.histogram_bin_count = configuration.histogram_bin_count;
+        self.histogram_bin_count
+            .set(configuration.histogram_bin_count);
         self.reset_cellular_response_view = true;
+        self.downsampling = configuration.downsampling;
         self.rotation = configuration.rotation;
         self.denoise_method = configuration
             .denoise
@@ -1852,8 +2978,10 @@ impl VCEMApp {
         self.reset_histogram_view = true;
         self.reset_cellular_response_view = true;
         self.clear_histogram_highlight();
+        self.invalidate_automata_lab();
         self.displayed_image = None;
         self.viewer_needs_fit = true;
+        self.downsampling = self.applied_downsampling;
         self.applied_denoise = None;
         self.invert_values = false;
         self.applied_invert = false;
@@ -1885,6 +3013,9 @@ impl VCEMApp {
             return;
         }
 
+        self.invalidate_automata_lab();
+        self.lab_pending_configuration = None;
+        self.candidates.invalidate();
         let id = self.next_processing_job_id;
         self.next_processing_job_id += 1;
         let (sender, receiver) = mpsc::channel();
@@ -1892,7 +3023,7 @@ impl VCEMApp {
         let job_kind = kind.clone();
 
         thread::spawn(move || {
-            let result = processed_image_from_path(&path, kind.parameters());
+            let result = crate::masks::process_source(&path, kind.parameters());
             let _ = sender.send(ProcessingResult {
                 id,
                 image_index,
@@ -1934,13 +3065,27 @@ impl VCEMApp {
         }
 
         match result.result {
-            Ok(processed) => {
+            Ok((processed, mask_frame)) => {
+                self.masks.activate(mask_frame);
+                if matches!(
+                    &result.kind,
+                    ProcessingKind::CellularAutomata(_) | ProcessingKind::Configuration(_)
+                ) {
+                    self.masks.show_current_ca();
+                }
+                self.invalidate_automata_lab();
+                if result.kind.parameters().downsampling != self.applied_downsampling {
+                    self.clear_histogram_highlight();
+                }
                 let texture_name = result.kind.texture_name(&result.image_name);
                 let size = processed.size;
+                let prepared_values = processed.prepared_values;
+                let calibration = processed.calibration;
                 let histogram = processed.histogram;
                 let bin_indices = processed.bin_indices;
                 let bin_count = processed.bin_count;
                 let cellular_automata_summary = processed.cellular_automata_summary;
+                let cellular_automata_result = processed.cellular_automata_result;
                 let cellular_automata_texture =
                     processed.cellular_automata_overlay.map(|overlay| {
                         ctx.load_texture(
@@ -1956,12 +3101,15 @@ impl VCEMApp {
                     image_index: result.image_index,
                     size,
                     texture,
+                    prepared_values,
+                    calibration,
                     bin_indices,
                     bin_count,
                     highlight_bins: Vec::new(),
                     highlight_texture: None,
                     cellular_automata_texture,
                     cellular_automata_summary,
+                    cellular_automata_result,
                 });
                 if self
                     .selected_histogram_bins
@@ -1973,11 +3121,19 @@ impl VCEMApp {
                 self.histogram = Some(histogram);
                 self.reset_histogram_view = true;
                 result.kind.apply_to(self);
+                if let Some(configuration) = self.lab_pending_configuration.take() {
+                    self.set_lab_draft_model(configuration.automaton);
+                    self.initialize_automata_lab(ctx);
+                    if configuration.generations > 0 {
+                        self.lab_replay_generations = Some(configuration.generations);
+                    }
+                }
                 if should_fit {
                     self.viewer_needs_fit = true;
                 }
             }
             Err(error) => {
+                self.lab_pending_configuration = None;
                 self.viewer_error = Some(error.clone());
                 self.histogram_error = Some(error);
             }
@@ -2174,6 +3330,7 @@ impl ProcessingKind {
     fn label(&self) -> &'static str {
         match self {
             Self::Preview(_) => "preview",
+            Self::Downsampling(_) => "downsampling",
             Self::Rotation(_) => "rotation",
             Self::Denoise(_) => "denoising",
             Self::Invert(_) => "inversion",
@@ -2187,6 +3344,9 @@ impl ProcessingKind {
     fn texture_name(&self, image_name: &str) -> String {
         match self {
             Self::Preview(_) => format!("{image_name} preview"),
+            Self::Downsampling(parameters) => {
+                format!("{image_name} {}", parameters.downsampling.label())
+            }
             Self::Rotation(parameters) => {
                 format!("{image_name} rotated {}", parameters.rotation.degrees())
             }
@@ -2230,6 +3390,7 @@ impl ProcessingKind {
     fn parameters(&self) -> &ExperimentConfiguration {
         match self {
             Self::Preview(parameters)
+            | Self::Downsampling(parameters)
             | Self::Rotation(parameters)
             | Self::Denoise(parameters)
             | Self::Invert(parameters)
@@ -2243,6 +3404,11 @@ impl ProcessingKind {
     fn apply_to(self, app: &mut VCEMApp) {
         match self {
             Self::Preview(_) => {}
+            Self::Downsampling(parameters) => {
+                app.applied_downsampling = parameters.downsampling;
+                app.downsampling = parameters.downsampling;
+                app.clear_histogram_highlight();
+            }
             Self::Rotation(parameters) => {
                 app.applied_rotation = parameters.rotation;
                 app.rotation = parameters.rotation;
@@ -2276,7 +3442,9 @@ impl ProcessingKind {
 
 impl ExperimentConfiguration {
     fn apply_as_current(self, app: &mut VCEMApp) {
-        app.histogram_bin_count = self.histogram_bin_count;
+        app.histogram_bin_count.set(self.histogram_bin_count);
+        app.applied_downsampling = self.downsampling;
+        app.downsampling = self.downsampling;
         app.applied_rotation = self.rotation;
         app.rotation = self.rotation;
         app.applied_denoise = self.denoise;
@@ -2387,6 +3555,59 @@ impl CellularKernelBrush {
             Self::Negative => "Paint red negative kernel cells.",
         }
     }
+}
+
+/// Above this dense table length, the discrete rule editor stops rendering a
+/// cell-by-cell grid and falls back to bulk-fill actions only. The engine's
+/// own `CompileLimits::max_table_bytes` (default 256 MiB) remains the real
+/// ceiling; this is purely a UI editing affordance.
+const MAX_DISCRETE_UI_TABLE_LEN: usize = 4096;
+
+/// Extracts a human-readable message from a caught worker-thread panic, so a
+/// crash surfaces as diagnosable text in the UI instead of a bare "the
+/// worker stopped" channel-disconnect error.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "no panic message was captured".to_owned()
+    }
+}
+
+fn discrete_program_state_count(document: &AutomataProgramDocument) -> Option<u32> {
+    match &document.transition_model {
+        AutomataModelDefinition::DiscreteMap(program) => Some(program.program.state_count),
+        _ => None,
+    }
+}
+
+fn discrete_rule_kind_label(kind: DiscreteRuleKind) -> &'static str {
+    match kind {
+        DiscreteRuleKind::Direct => "Direct",
+        DiscreteRuleKind::Aggregate => "Aggregate",
+        DiscreteRuleKind::OrderedNeighborhood => "Ordered neighbourhood",
+        DiscreteRuleKind::PresenceTriggered => "Presence triggered",
+    }
+}
+
+/// Converts a row-major `side x side` inclusion grid into kernel offsets in a
+/// fixed, deterministic scan order (never click/paint order), which matters
+/// for `OrderedNeighborhood`'s base-q table index.
+#[cfg(test)]
+fn kernel_offsets_from_grid(included: &[bool], side: u32) -> Vec<KernelOffset> {
+    let side_usize = side as usize;
+    let half = (side / 2) as i32;
+    let mut offsets = Vec::new();
+    for y in 0..side_usize {
+        for x in 0..side_usize {
+            if included[y * side_usize + x] {
+                offsets.push(KernelOffset::new(x as i32 - half, y as i32 - half));
+            }
+        }
+    }
+    offsets
 }
 
 fn resize_cellular_kernel(settings: &mut CellularAutomataSettings, new_size: usize) {
@@ -2557,75 +3778,6 @@ fn zoom_hovered_plot_with_scroll(plot_ui: &mut PlotUi<'_>) {
         .input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
 }
 
-fn validate_experiment_configuration(
-    configuration: &ExperimentConfiguration,
-) -> std::result::Result<(), String> {
-    if configuration.schema_version != 1 {
-        return Err(format!(
-            "Unsupported configuration schema version {}.",
-            configuration.schema_version
-        ));
-    }
-    if !(2..=4096).contains(&configuration.histogram_bin_count) {
-        return Err("Histogram bin count must be between 2 and 4096.".to_owned());
-    }
-    if let Some(denoise) = configuration.denoise
-        && !matches!(denoise.kernel_size, 3 | 5 | 7)
-    {
-        return Err("Denoising kernel size must be 3, 5, or 7.".to_owned());
-    }
-    if configuration
-        .equalization
-        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
-    {
-        return Err("Equalization strength must be between 0 and 1.".to_owned());
-    }
-    if configuration
-        .gamma
-        .is_some_and(|value| !value.is_finite() || !(0.001..=4.0).contains(&value))
-    {
-        return Err("Gamma must be between 0.001 and 4.".to_owned());
-    }
-
-    if let Some(settings) = &configuration.cellular_automata {
-        if !(3..=15).contains(&settings.kernel_size)
-            || settings.kernel_size.is_multiple_of(2)
-            || settings.kernel.len() != settings.kernel_size * settings.kernel_size
-        {
-            return Err("Cellular kernel must be an odd square from 3 x 3 to 15 x 15.".to_owned());
-        }
-        if settings.kernel.iter().any(|weight| !weight.is_finite())
-            || !settings
-                .kernel
-                .iter()
-                .any(|weight| weight.abs() > f32::EPSILON)
-        {
-            return Err("Cellular kernel must contain finite, non-zero weights.".to_owned());
-        }
-        let scalar_values = [
-            settings.response_center,
-            settings.response_width,
-            settings.growth_rate,
-            settings.decay_rate,
-            settings.time_step,
-        ];
-        if scalar_values.iter().any(|value| !value.is_finite()) {
-            return Err("Cellular response and evolution values must be finite.".to_owned());
-        }
-        if !(-1.0..=1.0).contains(&settings.response_center)
-            || !(0.01..=1.0).contains(&settings.response_width)
-            || !(0.0..=2.0).contains(&settings.growth_rate)
-            || !(0.0..=2.0).contains(&settings.decay_rate)
-            || !(0.01..=0.5).contains(&settings.time_step)
-            || !(1..=128).contains(&settings.iterations)
-        {
-            return Err("Cellular settings fall outside the supported UI ranges.".to_owned());
-        }
-    }
-
-    Ok(())
-}
-
 impl DisplayedImage {
     fn pixel_count(&self) -> usize {
         self.size.x as usize * self.size.y as usize
@@ -2651,7 +3803,9 @@ impl DisplayedImage {
             .floor()
             .clamp(0.0, (height - 1) as f32) as usize;
 
-        self.bin_indices.get(y * width + x).copied()
+        self.bin_indices
+            .get(y * width + x)
+            .and_then(|bin| usize::try_from(*bin).ok())
     }
 
     fn bins_in_pointer_rect(&self, image_rect: Rect, selection_rect: Rect) -> BTreeSet<usize> {
@@ -2684,8 +3838,10 @@ impl DisplayedImage {
         for y in min_y.min(max_y)..=min_y.max(max_y) {
             let row_start = y * width;
             for x in min_x.min(max_x)..=min_x.max(max_x) {
-                if let Some(bin) = self.bin_indices.get(row_start + x) {
-                    bins.insert(*bin);
+                if let Some(bin) = self.bin_indices.get(row_start + x)
+                    && let Ok(bin) = usize::try_from(*bin)
+                {
+                    bins.insert(bin);
                 }
             }
         }
@@ -2694,11 +3850,12 @@ impl DisplayedImage {
     }
 }
 
-fn histogram_highlight_rgba(bin_indices: &[usize], highlighted_bins: &BTreeSet<usize>) -> Vec<u8> {
+fn histogram_highlight_rgba(bin_indices: &[u32], highlighted_bins: &BTreeSet<usize>) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(bin_indices.len() * 4);
     for bin in bin_indices {
-        if highlighted_bins.contains(bin) {
-            rgba.extend_from_slice(&[255, 184, 54, 128]);
+        if usize::try_from(*bin).is_ok_and(|bin| highlighted_bins.contains(&bin)) {
+            let [r, g, b] = crate::types::PIXEL_SELECTION_RGB;
+            rgba.extend_from_slice(&[r, g, b, 128]);
         } else {
             rgba.extend_from_slice(&[0, 0, 0, 0]);
         }
@@ -2719,6 +3876,11 @@ impl DenoiseMethod {
 impl App for VCEMApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
         self.poll_processing_job(ui.ctx());
+        self.masks.poll(ui.ctx());
+        self.poll_automata_lab_job(ui.ctx());
+        self.poll_lab_replay(ui.ctx());
+        self.candidates.poll(ui.ctx());
+        self.advance_automata_lab(ui.ctx());
         self.show_upper_panel(ui);
         self.show_left_panel(ui);
         self.show_right_panel(ui);
@@ -2730,7 +3892,151 @@ impl App for VCEMApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{CellularKernelBrush, toggle_kernel_weight, toggled_kernel_brush};
+    use super::{
+        CellularKernelBrush, HistogramBinCountControl, kernel_offsets_from_grid,
+        toggle_kernel_weight, toggled_kernel_brush,
+    };
+    use crate::discrete_automata::KernelOffset;
+
+    #[test]
+    fn downsampling_applies_atomically_and_persists_across_configuration_and_frames() {
+        use super::*;
+        let ctx = egui::Context::default();
+        let mut app = VCEMApp::initial_state();
+        let dir =
+            std::env::temp_dir().join(format!("vcem-downsampling-app-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("source.png");
+        image::GrayImage::from_fn(8, 8, |x, y| image::Luma([(x * y * 4) as u8]))
+            .save(&path)
+            .unwrap();
+        app.add_image_paths(vec![path.clone()]);
+        app.applied_gamma = Some(1.2);
+        app.applied_cellular_automata = Some(CellularAutomataSettings {
+            iterations: 1,
+            ..Default::default()
+        });
+
+        let finish = |app: &mut VCEMApp| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while app.processing_job.is_some() {
+                assert!(Instant::now() < deadline, "image processing timed out");
+                app.poll_processing_job(&ctx);
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        app.downsampling = DownsamplingMethod::Nearest;
+        app.apply_downsampling(&ctx);
+        assert_eq!(app.applied_downsampling, DownsamplingMethod::AreaAverage);
+        finish(&mut app);
+        assert!(app.viewer_error.is_none(), "{:?}", app.viewer_error);
+        assert_eq!(app.applied_downsampling, DownsamplingMethod::Nearest);
+        assert!(
+            app.displayed_image
+                .as_ref()
+                .unwrap()
+                .cellular_automata_result
+                .is_some()
+        );
+        assert_eq!(app.applied_gamma, Some(1.2));
+
+        app.initialize_automata_lab(&ctx);
+        assert!(
+            app.automata_lab_session.is_some(),
+            "{:?}",
+            app.automata_lab_error
+        );
+        app.selected_histogram_bins.insert(1);
+        app.downsampling = DownsamplingMethod::Triangle;
+        app.apply_downsampling(&ctx);
+        finish(&mut app);
+        assert_eq!(app.applied_downsampling, DownsamplingMethod::Triangle);
+        assert!(app.selected_histogram_bins.is_empty());
+        assert!(app.automata_lab_session.is_none());
+        assert!(
+            app.histogram
+                .as_ref()
+                .unwrap()
+                .source_description
+                .contains("Triangle")
+        );
+
+        let previous_pixels = app
+            .displayed_image
+            .as_ref()
+            .unwrap()
+            .prepared_values
+            .clone();
+        app.images[0].path = dir.join("missing.png");
+        app.downsampling = DownsamplingMethod::AreaAverage;
+        app.apply_downsampling(&ctx);
+        finish(&mut app);
+        assert!(app.viewer_error.is_some());
+        assert_eq!(app.applied_downsampling, DownsamplingMethod::Triangle);
+        assert_eq!(
+            app.displayed_image.as_ref().unwrap().prepared_values,
+            previous_pixels
+        );
+        assert!(
+            app.histogram
+                .as_ref()
+                .unwrap()
+                .source_description
+                .contains("Triangle")
+        );
+        app.images[0].path = path.clone();
+
+        app.configuration_path = dir.join("experiment.json").display().to_string();
+        app.save_applied_configuration();
+        assert!(app.configuration_error.is_none());
+        app.saved_configuration = None;
+        app.load_configuration();
+        assert_eq!(
+            app.saved_configuration.as_ref().unwrap().downsampling,
+            DownsamplingMethod::Triangle
+        );
+        app.apply_saved_configuration(&ctx);
+        finish(&mut app);
+        assert_eq!(app.applied_downsampling, DownsamplingMethod::Triangle);
+
+        app.reset_image_augmentations(&ctx);
+        assert_eq!(app.downsampling, DownsamplingMethod::Triangle);
+        assert_eq!(
+            app.applied_experiment_configuration().downsampling,
+            DownsamplingMethod::Triangle
+        );
+        let next_path = dir.join("next.png");
+        fs::copy(&path, &next_path).unwrap();
+        app.add_image_paths(vec![next_path]);
+        assert_eq!(app.selected_image, Some(1));
+        assert_eq!(app.downsampling, DownsamplingMethod::Triangle);
+        app.ensure_selected_image_loaded(&ctx);
+        finish(&mut app);
+        assert!(
+            app.histogram
+                .as_ref()
+                .unwrap()
+                .source_description
+                .contains("Triangle")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn histogram_bin_count_is_staged_until_committed() {
+        let mut control = HistogramBinCountControl::new(256);
+
+        *control.draft_mut() = 4096;
+        assert_eq!(control.applied(), 256);
+
+        control.commit();
+        assert_eq!(control.applied(), 4096);
+
+        *control.draft_mut() = 128;
+        control.set(512);
+        assert_eq!(control.applied(), 512);
+        assert_eq!(*control.draft_mut(), 512);
+    }
 
     #[test]
     fn selected_kernel_sign_toggles_off_and_back_on() {
@@ -2770,5 +4076,38 @@ mod tests {
             toggled_kernel_brush(1.0, CellularKernelBrush::Negative),
             CellularKernelBrush::Negative
         ));
+    }
+
+    #[test]
+    fn kernel_grid_offsets_use_a_fixed_row_major_order_regardless_of_toggle_order() {
+        // A 3x3 grid with the top-left and bottom-right corners included.
+        let included = [
+            true, false, false, //
+            false, false, false, //
+            false, false, true,
+        ];
+        let offsets = kernel_offsets_from_grid(&included, 3);
+        assert_eq!(
+            offsets,
+            vec![KernelOffset::new(-1, -1), KernelOffset::new(1, 1)]
+        );
+
+        // Toggling the same two cells in the opposite order must not change
+        // the resulting order: it always follows the row-major scan.
+        let same_included = [
+            false, false, true, //
+            false, false, false, //
+            true, false, false,
+        ];
+        let offsets_reversed_input = kernel_offsets_from_grid(&same_included, 3);
+        assert_eq!(
+            offsets_reversed_input,
+            vec![KernelOffset::new(1, -1), KernelOffset::new(-1, 1)]
+        );
+    }
+
+    #[test]
+    fn kernel_grid_offsets_are_empty_for_an_all_excluded_grid() {
+        assert!(kernel_offsets_from_grid(&[false; 9], 3).is_empty());
     }
 }
